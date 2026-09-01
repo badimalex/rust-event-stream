@@ -22,7 +22,6 @@ async fn main() {
         .unwrap();
     println!("Сервер запущен на http://127.0.0.1:3000");
 
-    // 3. Запускаем сервер
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await

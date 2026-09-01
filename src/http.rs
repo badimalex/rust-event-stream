@@ -1,10 +1,15 @@
+use std::time::Duration;
+
 use axum::{
-    Json, Router,
+    BoxError, Json, Router,
+    error_handling::HandleErrorLayer,
     extract::State,
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use tower::ServiceBuilder;
+use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     domain::{DomainError, Event},
@@ -18,11 +23,43 @@ pub struct AppState {
 }
 
 pub fn build_router(state: AppState) -> Router {
+    let api_router = Router::new()
+        .route("/v1/events", post(create_event_handler))
+        .layer(
+            ServiceBuilder::new()
+                .layer(RequestBodyLimitLayer::new(1024 * 1024))
+                .layer(HandleErrorLayer::new(handle_middleware_errors))
+                .load_shed()
+                .concurrency_limit(100)
+                .timeout(Duration::from_secs(5)),
+        );
+
     Router::new()
         .route("/health", get(health))
         .route("/ready", get(ready))
-        .route("/v1/events", post(create_event_handler))
+        .merge(api_router)
         .with_state(state)
+}
+
+async fn handle_middleware_errors(err: BoxError) -> (StatusCode, String) {
+    if err.is::<tower::timeout::error::Elapsed>() {
+        return (
+            StatusCode::REQUEST_TIMEOUT,
+            "Request timed out.".to_string(),
+        );
+    }
+
+    if err.is::<tower::load_shed::error::Overloaded>() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "Server is overloaded. Please try again later.".to_string(),
+        );
+    }
+
+    (
+        StatusCode::INTERNAL_SERVER_ERROR,
+        format!("Unhandled middleware error: {}", err),
+    )
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +155,117 @@ mod tests {
         body::Body,
         http::{Request, StatusCode},
     };
+    use tokio::task::JoinSet;
     use tower::util::ServiceExt;
+
+    #[tokio::test]
+    async fn oversized_body_is_rejected() {
+        let (producer, _, _) = BoundedQueue::new(100);
+        let shared_state = AppState { producer };
+
+        let app = build_router(shared_state);
+
+        let oversized_bytes = vec![0u8; 1_048_576 + 1];
+
+        let request = axum::http::Request::builder()
+            .method(axum::http::Method::POST)
+            .uri("/v1/events")
+            .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .body(axum::body::Body::from(oversized_bytes))
+            .unwrap();
+
+        use tower::ServiceExt;
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
+    }
+
+    #[tokio::test]
+    async fn slow_request_times_out() {
+        let (producer, mut _queue, _worker) = BoundedQueue::new(1);
+        let shared_state = AppState { producer };
+
+        let app = build_router(shared_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        let clone_app = app.clone();
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"2","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        let response = clone_app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+    }
+
+    #[tokio::test]
+    async fn concurrency_limit_is_enforced() {
+        let (producer, mut _queue, _worker) = BoundedQueue::new(1);
+        let shared_state = AppState { producer };
+
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        let mut join_set = JoinSet::new();
+
+        for _ in 0..101 {
+            let req_service = app_clone.clone();
+
+            join_set.spawn(async move {
+                let request = axum::http::Request::builder()
+                    .method("POST")
+                    .uri("/v1/events")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+                    .unwrap();
+
+                req_service.oneshot(request).await.unwrap()
+            });
+        }
+
+        let mut responses = Vec::new();
+
+        while let Some(res) = join_set.join_next().await {
+            responses.push(res.unwrap());
+        }
+
+        let mut timeout_count = 0;
+        let mut overload_count = 0;
+
+        for response in responses {
+            match response.status() {
+                StatusCode::REQUEST_TIMEOUT => timeout_count += 1,
+                StatusCode::SERVICE_UNAVAILABLE => overload_count += 1,
+                status => panic!("unexpected status: {status}"),
+            }
+        }
+
+        assert_eq!(timeout_count, 100);
+        assert_eq!(overload_count, 1);
+    }
 
     #[tokio::test]
     async fn health_returns_success() {
