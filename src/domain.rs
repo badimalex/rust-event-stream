@@ -1,10 +1,12 @@
-#[derive(Debug, Clone, PartialEq)]
+use serde::Serialize;
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Event {
     pub event_id: String,
     pub tenant_id: String,
     pub event_type: String,
-    pub timestamp: u64,
-    pub payload: String,
+    pub event_timestamp: u64,
+    pub payload: serde_json::Value,
 }
 
 #[derive(Debug)]
@@ -36,8 +38,8 @@ impl Event {
             event_id,
             tenant_id,
             event_type,
-            timestamp,
-            payload,
+            event_timestamp: timestamp,
+            payload: serde_json::Value::String(payload),
         })
     }
 }

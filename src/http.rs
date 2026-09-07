@@ -3,7 +3,7 @@ use std::time::Duration;
 use axum::{
     BoxError, Json, Router,
     error_handling::HandleErrorLayer,
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -13,17 +13,26 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use crate::{
     domain::{DomainError, Event},
-    pipeline::EventProducer,
+    pipeline::{EventProducer, EventSendError},
+    storage::Storage,
 };
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone)]
-pub struct AppState {
+pub struct AppState<S>
+where
+    S: Storage + Clone,
+{
     pub producer: EventProducer,
+    pub storage: S,
 }
 
-pub fn build_router(state: AppState) -> Router {
+pub fn build_router<S>(state: AppState<S>) -> Router
+where
+    S: Storage + Clone + 'static,
+{
     let api_router = Router::new()
+        .route("/v1/events/{id}", get(get_event::<S>))
         .route("/v1/events", post(create_event_handler))
         .layer(
             ServiceBuilder::new()
@@ -113,6 +122,10 @@ impl IntoResponse for ApiError {
             ApiError::PipelineUnavailable => {
                 (StatusCode::SERVICE_UNAVAILABLE, "pipeline unavailable").into_response()
             }
+
+            ApiError::NotFound => StatusCode::NOT_FOUND.into_response(),
+
+            ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
         }
     }
 }
@@ -120,21 +133,46 @@ impl IntoResponse for ApiError {
 enum ApiError {
     Domain(DomainError),
     PipelineUnavailable,
+    NotFound,
+    Internal,
 }
 
-async fn create_event_handler(
-    State(state): State<AppState>,
+async fn create_event_handler<S>(
+    State(state): State<AppState<S>>,
     Json(payload): Json<CreateEventRequest>,
-) -> Result<StatusCode, ApiError> {
+) -> Result<StatusCode, ApiError>
+where
+    S: Storage + Clone + 'static,
+{
     let event: Event = payload.try_into().map_err(ApiError::Domain)?;
 
-    state
-        .producer
-        .send_event(event)
-        .await
-        .map_err(|_| ApiError::PipelineUnavailable)?;
+    return match state.producer.send_event(event).await {
+        Ok(_) => Ok(StatusCode::CREATED),
+        Err(EventSendError::QueueClosed | EventSendError::WorkerDropped) => {
+            Err(ApiError::PipelineUnavailable)
+        }
+        Err(EventSendError::Storage(error)) => {
+            eprintln!("storage error while creating event: {error}");
+            Err(ApiError::Internal)
+        }
+    };
+}
 
-    Ok(StatusCode::CREATED)
+async fn get_event<S>(
+    State(state): State<AppState<S>>,
+    Path(event_id): Path<String>,
+) -> Result<Json<Event>, ApiError>
+where
+    S: Storage + Clone + 'static,
+{
+    match state.storage.get_by_id(&event_id).await {
+        Ok(Some(event)) => Ok(Json(event)),
+        Ok(None) => Err(ApiError::NotFound),
+        Err(error) => {
+            eprintln!("storage error: {error}");
+            Err(ApiError::Internal)
+        }
+    }
 }
 
 async fn health() -> &'static str {
@@ -147,7 +185,10 @@ async fn ready() -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipeline::BoundedQueue;
+    use crate::{
+        pipeline::BoundedQueue,
+        storage::{BlockingStorage, FailingStorage, TestStorage},
+    };
 
     use super::*;
 
@@ -160,8 +201,13 @@ mod tests {
 
     #[tokio::test]
     async fn oversized_body_is_rejected() {
-        let (producer, _, _) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
 
         let app = build_router(shared_state);
 
@@ -182,8 +228,13 @@ mod tests {
 
     #[tokio::test]
     async fn slow_request_times_out() {
-        let (producer, mut _queue, _worker) = BoundedQueue::new(1);
-        let shared_state = AppState { producer };
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone());
+
+        queue.spawn(worker);
+
+        let shared_state = AppState { producer, storage };
 
         let app = build_router(shared_state);
 
@@ -194,27 +245,27 @@ mod tests {
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
-        let clone_app = app.clone();
-        let response = app.oneshot(request).await.unwrap();
+        let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        storage_check.wait_until_blocked().await;
+        let response = response_task.await.unwrap();
+        assert_eq!(response.status(), StatusCode::REQUEST_TIMEOUT);
 
-        assert_eq!(response.status(), StatusCode::CREATED);
-
-        let request = axum::http::Request::builder()
-            .method("POST")
-            .uri("/v1/events")
-            .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"2","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
-            .unwrap();
-
-        let response = clone_app.oneshot(request).await.unwrap();
-
-        assert_eq!(response.status(), axum::http::StatusCode::REQUEST_TIMEOUT);
+        storage_check.release_first_persist();
+        queue.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn concurrency_limit_is_enforced() {
-        let (producer, mut _queue, _worker) = BoundedQueue::new(1);
-        let shared_state = AppState { producer };
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone());
+
+        queue.spawn(worker);
+
+        let shared_state = AppState {
+            producer,
+            storage: storage.clone(),
+        };
 
         let app = build_router(shared_state);
         let app_clone = app.clone();
@@ -226,13 +277,13 @@ mod tests {
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
-        let response = app.oneshot(request).await.unwrap();
-        assert_eq!(response.status(), StatusCode::CREATED);
+        let first_handle = tokio::spawn(async move { app_clone.oneshot(request).await.unwrap() });
 
+        storage_check.wait_until_blocked().await;
         let mut join_set = JoinSet::new();
 
-        for _ in 0..101 {
-            let req_service = app_clone.clone();
+        for _ in 0..100 {
+            let req_service = app.clone();
 
             join_set.spawn(async move {
                 let request = axum::http::Request::builder()
@@ -255,6 +306,12 @@ mod tests {
         let mut timeout_count = 0;
         let mut overload_count = 0;
 
+        let first_response = first_handle.await.unwrap();
+        match first_response.status() {
+            StatusCode::REQUEST_TIMEOUT => timeout_count += 1,
+            status => panic!("unexpected first response status: {status}"),
+        }
+
         for response in responses {
             match response.status() {
                 StatusCode::REQUEST_TIMEOUT => timeout_count += 1,
@@ -265,12 +322,21 @@ mod tests {
 
         assert_eq!(timeout_count, 100);
         assert_eq!(overload_count, 1);
+
+        storage_check.release_first_persist();
+
+        queue.shutdown().await.unwrap();
     }
 
     #[tokio::test]
     async fn health_returns_success() {
-        let (producer, _, _) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
         let app = build_router(shared_state);
 
         let request = Request::builder()
@@ -286,8 +352,13 @@ mod tests {
 
     #[tokio::test]
     async fn ready_returns_success() {
-        let (producer, _, _) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
         let app = build_router(shared_state);
 
         let request = Request::builder()
@@ -303,8 +374,13 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_json_is_rejected() {
-        let (producer, _, _) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
         let app = build_router(shared_state);
 
         let request = Request::builder()
@@ -321,9 +397,14 @@ mod tests {
 
     #[tokio::test]
     async fn valid_event_is_accepted() {
-        let (producer, mut queue, worker) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
-        let sink = worker.sink.clone();
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
 
         queue.spawn(worker);
 
@@ -344,9 +425,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::CREATED);
         queue.shutdown().await.unwrap();
 
-        assert_eq!(sink.records.lock().await.len(), 1);
+        assert_eq!(sink.events.lock().await.len(), 1);
         assert_eq!(
-            sink.records.lock().await[0],
+            sink.events.lock().await[0],
             Event::new(
                 "1".to_string(),
                 "2".to_string(),
@@ -360,8 +441,13 @@ mod tests {
 
     #[tokio::test]
     async fn closed_or_unavailable_pipeline_is_not_reported_as_success() {
-        let (producer, mut queue, worker) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
 
         drop(worker);
 
@@ -385,9 +471,14 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_event_is_rejected() {
-        let (producer, mut queue, worker) = BoundedQueue::new(100);
-        let shared_state = AppState { producer };
-        let sink = worker.sink.clone();
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
         queue.spawn(worker);
 
         let app = build_router(shared_state);
@@ -404,6 +495,126 @@ mod tests {
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         queue.shutdown().await.unwrap();
 
-        assert_eq!(sink.records.lock().await.len(), 0);
+        assert_eq!(sink.events.lock().await.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn existing_event_returns_200() {
+        let storage = TestStorage::default();
+        let _ = storage
+            .persist(
+                &Event::new(
+                    "evt-123".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    12345,
+                    "1".to_string(),
+                )
+                .unwrap(),
+            )
+            .await;
+
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+
+        // 3. Construct the GET request
+        let request = Request::builder()
+            .uri("/v1/events/evt-123")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 200 OK
+        assert_eq!(response.status(), StatusCode::OK);
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_event_returns_404() {
+        let storage = TestStorage::default();
+        let _ = storage
+            .persist(
+                &Event::new(
+                    "evt-123".to_string(),
+                    "1".to_string(),
+                    "1".to_string(),
+                    12345,
+                    "1".to_string(),
+                )
+                .unwrap(),
+            )
+            .await;
+
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+
+        // 3. Construct the GET request
+        let request = Request::builder()
+            .uri("/v1/events/evt-345")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 200 OK
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn storage_error_returns_500() {
+        let storage = FailingStorage::default();
+
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+
+        // 3. Construct the GET request
+        let request = Request::builder()
+            .uri("/v1/events/evt-failed")
+            .method("GET")
+            .body(axum::body::Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 200 OK
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        queue.shutdown().await.unwrap();
     }
 }
