@@ -4,7 +4,7 @@
 
 Clients send events through an HTTP API. The service validates incoming data, passes accepted events through a bounded asynchronous pipeline, and processes them in a background worker.
 
-The current implementation uses an in-memory `TemporarySink`. Persistent PostgreSQL storage will be added in a later development stage.
+Accepted events are persisted to PostgreSQL using batched writes.
 
 ## Features
 
@@ -19,6 +19,17 @@ The current implementation uses an in-memory `TemporarySink`. Persistent Postgre
 - Load shedding during overload
 - Graceful shutdown with queue draining
 - `/health` and `/ready` endpoints
+
+## Performance
+
+Benchmark: 100 concurrent clients, 30 seconds, 0% errors.
+
+| Persistence strategy                                                                                         | Successful events |      Throughput |
+| ------------------------------------------------------------------------------------------------------------ | ----------------: | --------------: |
+| [Single-row writes baseline](https://github.com/badimalex/rust-event-stream/tree/perf-baseline-pre-batching) | 60,095 | 2,000 events/s |
+| [Batched PostgreSQL writes](https://github.com/badimalex/rust-event-stream/commit/52dd1b90686ee768b58961afaf06244a0cff55f1) | 307,022 | 10,217 events/s |
+**Result: ~5.1× higher error-free event persistence throughput.**
+
 
 ## Architecture
 
@@ -38,14 +49,10 @@ Bounded mpsc queue
   ↓
 Worker
   ↓
-TemporarySink
+PostgresStorage
 ```
 
 The bounded queue prevents unlimited memory growth when producers submit events faster than the worker can process them. When the queue is full, backpressure forces producers to wait instead of continuously accumulating work.
-
-The `Worker` runs independently from the HTTP request path, receives events from the channel, processes them, and writes them to the current sink.
-
-`TemporarySink` is an in-memory storage implementation used until persistent PostgreSQL storage is introduced.
 
 ## HTTP API
 
@@ -111,17 +118,13 @@ Events that were already accepted are not discarded. The worker drains the remai
 
 The application completes shutdown after the worker has finished processing the remaining work.
 
-## Storage
-
-Currently, processed events are stored in an in-memory `TemporarySink`.
-
-Persistent PostgreSQL storage is planned for a later development stage.
-
 ## Running Locally
 
 ### Requirements
 
 - Rust toolchain
+- PostgreSQL
+- `sqlx-cli`
 
 ### Run
 
