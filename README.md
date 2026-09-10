@@ -69,6 +69,15 @@ Successful requests return:
 201 Created
 ```
 
+
+```bash
+curl -i -X POST http://127.0.0.1:3000/v1/events \
+  -H "Content-Type: application/json" \
+  -d '{"event_id":"db-down-1","tenant_id":"t-1","event_type":"test","timestamp":123456789,"payload":"hello"}'
+
+```
+
+
 ### `GET /health`
 
 Basic liveness endpoint.
@@ -115,6 +124,10 @@ Persistent PostgreSQL storage is planned for a later development stage.
 - Rust toolchain
 
 ### Run
+
+```bash
+sqlx migrate run
+```
 
 ```bash
 cargo run

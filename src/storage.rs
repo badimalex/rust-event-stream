@@ -27,11 +27,10 @@ impl From<sqlx::Error> for StorageError {
         StorageError::Database(err)
     }
 }
-
 pub trait Storage: Send + Sync {
     fn persist<'a>(
         &'a self,
-        event: &'a Event,
+        events: &'a [Event],
     ) -> impl Future<Output = Result<(), StorageError>> + Send + 'a;
 
     fn get_by_id<'a>(
@@ -52,7 +51,44 @@ impl PostgresStorage {
 }
 
 impl Storage for PostgresStorage {
-    async fn persist(&self, event: &Event) -> Result<(), StorageError> {
+    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
+        if events.is_empty() {
+            return Ok(());
+        }
+
+        // Собираем векторы для каждого поля, чтобы передать их как массивы
+        let mut event_ids = Vec::with_capacity(events.len());
+        let mut tenant_ids = Vec::with_capacity(events.len());
+        let mut event_types = Vec::with_capacity(events.len());
+        let mut event_timestamps = Vec::with_capacity(events.len());
+        let mut payloads = Vec::with_capacity(events.len());
+
+        for event in events {
+            event_ids.push(&event.event_id);
+            tenant_ids.push(&event.tenant_id);
+            event_types.push(&event.event_type);
+            event_timestamps.push(event.event_timestamp as i64);
+            payloads.push(&event.payload);
+        }
+
+        sqlx::query(
+            r#"
+        INSERT INTO events (event_id, tenant_id, event_type, event_timestamp, payload)
+        SELECT * FROM UNNEST($1, $2, $3, $4, $5::jsonb[])
+        "#,
+        )
+        .bind(&event_ids)
+        .bind(&tenant_ids)
+        .bind(&event_types)
+        .bind(&event_timestamps)
+        .bind(&payloads)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /*async fn persist(&self, event: &Event) -> Result<(), StorageError> {
         sqlx::query(
             r#"
             INSERT INTO events (event_id, tenant_id, event_type, event_timestamp, payload)
@@ -68,7 +104,7 @@ impl Storage for PostgresStorage {
         .await?;
 
         Ok(())
-    }
+    }*/
 
     async fn get_by_id(&self, event_id: &str) -> Result<Option<Event>, StorageError> {
         let row = sqlx::query(
@@ -108,11 +144,54 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn test_persist_batch_saves_multiple_events(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+
+        let empty_batch: Vec<Event> = vec![];
+        let result = storage.persist(&empty_batch).await;
+        assert!(
+            result.is_ok(),
+            "Пустой батч должен обрабатываться без ошибок"
+        );
+
+        let event_1 = mock_event("evt_batch_1");
+        let event_2 = mock_event("evt_batch_2");
+        let event_3 = mock_event("evt_batch_3");
+
+        let batch = vec![event_1.clone(), event_2.clone(), event_3.clone()];
+
+        let persist_result = storage.persist(&batch).await;
+        assert!(persist_result.is_ok(), "Пакетная вставка вернула ошибку");
+
+        let saved_event_ids: Vec<String> =
+            sqlx::query!("SELECT event_id FROM events ORDER BY event_id ASC",)
+                .fetch_all(&storage.pool)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.event_id)
+                .collect();
+
+        assert_eq!(saved_event_ids.len(), 3);
+        assert_eq!(
+            saved_event_ids,
+            vec!["evt_batch_1", "evt_batch_2", "evt_batch_3"]
+        );
+
+        let loaded_event = storage.get_by_id("evt_batch_2").await.unwrap();
+        assert_eq!(
+            loaded_event,
+            Some(event_2),
+            "Данные события изменились при сохранении"
+        );
+    }
+
+    #[sqlx::test]
     async fn event_is_persisted(pool: sqlx::PgPool) {
         let storage = PostgresStorage::new(pool);
         let event = mock_event("evt_001");
 
-        let result = storage.persist(&event).await;
+        let result = storage.persist(&[event]).await;
         assert!(result.is_ok());
 
         let event = sqlx::query!(
@@ -131,7 +210,7 @@ mod tests {
         let storage = PostgresStorage::new(pool);
         let event = mock_event("evt_002");
 
-        storage.persist(&event).await.unwrap();
+        storage.persist(std::slice::from_ref(&event)).await.unwrap();
 
         let loaded = storage.get_by_id("evt_002").await.unwrap();
         assert_eq!(loaded, Some(event));
@@ -153,10 +232,13 @@ mod tests {
         let event_2 = mock_event("event-3"); // Тот же ID
 
         // Первый раз сохраняется успешно
-        storage.persist(&event_1).await.unwrap();
+        storage
+            .persist(std::slice::from_ref(&event_1))
+            .await
+            .unwrap();
 
         // Второй раз ожидаем ошибку дублирования
-        let result = storage.persist(&event_2).await;
+        let result = storage.persist(std::slice::from_ref(&event_2)).await;
 
         assert!(result.is_err());
         // match result.unwrap_err() {
@@ -188,7 +270,7 @@ pub(crate) struct BlockingStorage {
 
 #[cfg(test)]
 impl Storage for BlockingStorage {
-    async fn persist(&self, event: &Event) -> Result<(), StorageError> {
+    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
         let is_first = {
             let mut calls = self.persist_calls.lock().await;
             let is_first = *calls == 0;
@@ -201,7 +283,7 @@ impl Storage for BlockingStorage {
             self.release.notified().await;
         }
 
-        self.events.lock().await.push(event.clone());
+        self.events.lock().await.extend_from_slice(events);
 
         Ok(())
     }
@@ -233,7 +315,7 @@ pub(crate) struct FailingStorage {}
 
 #[cfg(test)]
 impl Storage for FailingStorage {
-    async fn persist(&self, _event: &Event) -> Result<(), StorageError> {
+    async fn persist(&self, _event: &[Event]) -> Result<(), StorageError> {
         Err(StorageError::Unavailable("forced test failure".to_string()))
     }
 
@@ -244,8 +326,8 @@ impl Storage for FailingStorage {
 
 #[cfg(test)]
 impl Storage for TestStorage {
-    async fn persist(&self, event: &Event) -> Result<(), StorageError> {
-        self.events.lock().await.push(event.clone());
+    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
+        self.events.lock().await.extend_from_slice(events);
 
         Ok(())
     }

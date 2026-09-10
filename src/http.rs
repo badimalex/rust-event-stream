@@ -203,7 +203,7 @@ mod tests {
     async fn oversized_body_is_rejected() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -230,7 +230,7 @@ mod tests {
     async fn slow_request_times_out() {
         let storage = BlockingStorage::default();
         let storage_check = storage.clone();
-        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone());
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone(), 3);
 
         queue.spawn(worker);
 
@@ -258,7 +258,7 @@ mod tests {
     async fn concurrency_limit_is_enforced() {
         let storage = BlockingStorage::default();
         let storage_check = storage.clone();
-        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone());
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone(), 3);
 
         queue.spawn(worker);
 
@@ -332,7 +332,7 @@ mod tests {
     async fn health_returns_success() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -354,7 +354,7 @@ mod tests {
     async fn ready_returns_success() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -376,7 +376,7 @@ mod tests {
     async fn invalid_json_is_rejected() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage);
+        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -400,7 +400,7 @@ mod tests {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
         let sink = storage.clone();
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -443,7 +443,7 @@ mod tests {
     async fn closed_or_unavailable_pipeline_is_not_reported_as_success() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -474,7 +474,7 @@ mod tests {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
         let sink = storage.clone();
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -502,21 +502,19 @@ mod tests {
     async fn existing_event_returns_200() {
         let storage = TestStorage::default();
         let _ = storage
-            .persist(
-                &Event::new(
-                    "evt-123".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
+            .persist(&[Event::new(
+                "evt-123".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                12345,
+                "1".to_string(),
             )
+            .unwrap()])
             .await;
 
         let storage_clone = storage.clone();
 
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -546,21 +544,19 @@ mod tests {
     async fn unknown_event_returns_404() {
         let storage = TestStorage::default();
         let _ = storage
-            .persist(
-                &Event::new(
-                    "evt-123".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
+            .persist(&[Event::new(
+                "evt-123".to_string(),
+                "1".to_string(),
+                "1".to_string(),
+                12345,
+                "1".to_string(),
             )
+            .unwrap()])
             .await;
 
         let storage_clone = storage.clone();
 
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
@@ -592,7 +588,7 @@ mod tests {
 
         let storage_clone = storage.clone();
 
-        let (producer, mut queue, worker) = BoundedQueue::new(100, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,

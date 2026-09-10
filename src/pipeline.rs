@@ -1,3 +1,6 @@
+use std::sync::Arc;
+use std::time::Duration;
+
 use tokio::sync::mpsc::{Receiver, Sender, channel};
 use tokio::sync::oneshot;
 use tokio::task::{JoinError, JoinHandle};
@@ -6,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use crate::domain::Event;
 use crate::storage::{Storage, StorageError};
 
-type ReplyTx = tokio::sync::oneshot::Sender<Result<(), StorageError>>;
+type ReplyTx = tokio::sync::oneshot::Sender<Result<(), Arc<StorageError>>>;
 
 struct PersistRequest {
     event: Event,
@@ -22,7 +25,7 @@ pub struct EventProducer {
 pub enum EventSendError {
     QueueClosed,
     WorkerDropped,
-    Storage(StorageError),
+    Storage(Arc<StorageError>),
 }
 
 impl EventProducer {
@@ -52,7 +55,11 @@ pub struct BoundedQueue {
 }
 
 impl BoundedQueue {
-    pub fn new<S>(buffer_size: usize, storage: S) -> (EventProducer, Self, Worker<S>)
+    pub fn new<S>(
+        buffer_size: usize,
+        storage: S,
+        batch_size: usize,
+    ) -> (EventProducer, Self, Worker<S>)
     where
         S: Storage,
     {
@@ -70,6 +77,10 @@ impl BoundedQueue {
             rx,
             storage,
             cancel_token,
+            batch_size,
+            flush_interval: Duration::from_millis(50),
+            buffer: Vec::new(),
+            flush_deadline: None,
         };
 
         (producer, app, worker)
@@ -101,6 +112,11 @@ where
     rx: Receiver<PersistRequest>,
     storage: S,
     cancel_token: CancellationToken,
+
+    batch_size: usize,
+    flush_interval: Duration,
+    flush_deadline: Option<tokio::time::Instant>,
+    buffer: Vec<PersistRequest>,
 }
 
 impl<S> Worker<S>
@@ -109,19 +125,34 @@ where
 {
     pub async fn run(mut self) {
         loop {
+            let deadline = self.flush_deadline;
+
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
                     break;
                 }
 
                 Some(request) = self.rx.recv() => {
-                    let result = self.storage.persist(&request.event).await;
-
-                    if let Err(error) = &result {
-                        eprintln!("failed to persist event: {error}");
+                    if self.buffer.is_empty() {
+                        self.flush_deadline = Some(tokio::time::Instant::now() + self.flush_interval);
                     }
 
-                    let _ = request.reply_to.send(result);
+                    self.buffer.push(request);
+
+                    if self.buffer.len() >= self.batch_size {
+                        self.flush_buffer().await;
+                        self.flush_deadline = None;
+                    }
+                }
+
+                _ = async {
+                    match deadline {
+                        Some(deadline) => tokio::time::sleep_until(deadline).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => {
+                    self.flush_buffer().await;
+                    self.flush_deadline = None;
                 }
 
                 else => {
@@ -133,14 +164,40 @@ where
         self.rx.close();
 
         while let Some(request) = self.rx.recv().await {
-            let result = self.storage.persist(&request.event).await;
+            self.buffer.push(request);
 
-            if let Err(error) = &result {
-                eprintln!("failed to persist event: {error}");
+            if self.buffer.len() >= self.batch_size {
+                self.flush_buffer().await;
             }
-
-            let _ = request.reply_to.send(result);
         }
+
+        self.flush_buffer().await;
+    }
+
+    async fn flush_buffer(&mut self) {
+        if self.buffer.is_empty() {
+            return;
+        }
+
+        let batch = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.batch_size));
+
+        let (events, reply_tos): (Vec<Event>, Vec<ReplyTx>) =
+            batch.into_iter().map(|p| (p.event, p.reply_to)).unzip();
+
+        let result = self.storage.persist(&events).await;
+        match result {
+            Ok(_) => {
+                for reply_to in reply_tos {
+                    let _ = reply_to.send(Ok(()));
+                }
+            }
+            Err(error) => {
+                let error = Arc::new(error);
+                for reply_to in reply_tos {
+                    let _ = reply_to.send(Err(Arc::clone(&error)));
+                }
+            }
+        };
     }
 }
 
@@ -151,30 +208,49 @@ mod tests {
     use crate::storage::{BlockingStorage, FailingStorage, TestStorage};
 
     use super::*;
+    fn mock_event(id: &str) -> Event {
+        Event {
+            event_id: id.to_string(),
+            tenant_id: "tenant-123".to_string(),
+            event_type: "user.signed_up".to_string(),
+            event_timestamp: 1700000000,
+            payload: serde_json::json!({"user_id": 42}),
+        }
+    }
 
     #[tokio::test]
     async fn worker_sends_events_to_sink() {
         let storage = TestStorage::default();
-        let (producer, mut queue, worker) = BoundedQueue::new(2, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(2, storage, 3);
 
         let sink = worker.storage.clone();
 
         queue.spawn(worker);
 
-        producer
-            .send_event(
-                Event::new(
-                    "1".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await
-            .unwrap();
-        producer
+        producer.send_event(mock_event("1")).await.unwrap();
+        producer.send_event(mock_event("2")).await.unwrap();
+        producer.send_event(mock_event("3")).await.unwrap();
+        producer.send_event(mock_event("4")).await.unwrap();
+
+        queue.shutdown().await.unwrap();
+
+        assert_eq!(sink.events.lock().await.len(), 4);
+        assert_eq!(sink.events.lock().await[0], mock_event("1"));
+        assert_eq!(sink.events.lock().await[1], mock_event("2"));
+        assert_eq!(sink.events.lock().await[2], mock_event("3"));
+        assert_eq!(sink.events.lock().await[3], mock_event("4"));
+    }
+
+    #[tokio::test]
+    async fn worker_completion_is_observable() {
+        let storage = TestStorage::default();
+        let (producer, mut queue, worker) = BoundedQueue::new(2, storage, 3);
+
+        let sink = worker.storage.clone();
+
+        queue.spawn(worker);
+        let _ = producer.send_event(mock_event("1")).await;
+        let _ = producer
             .send_event(
                 Event::new(
                     "2".to_string(),
@@ -185,9 +261,8 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .await
-            .unwrap();
-        producer
+            .await;
+        let _ = producer
             .send_event(
                 Event::new(
                     "3".to_string(),
@@ -198,9 +273,8 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .await
-            .unwrap();
-        producer
+            .await;
+        let _ = producer
             .send_event(
                 Event::new(
                     "4".to_string(),
@@ -211,45 +285,12 @@ mod tests {
                 )
                 .unwrap(),
             )
-            .await
-            .unwrap();
+            .await;
 
         queue.shutdown().await.unwrap();
 
         assert_eq!(sink.events.lock().await.len(), 4);
-        assert_eq!(
-            sink.events.lock().await[0],
-            Event::new(
-                "1".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            sink.events.lock().await[1],
-            Event::new(
-                "2".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            sink.events.lock().await[2],
-            Event::new(
-                "3".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
+        assert_eq!(sink.events.lock().await[0], mock_event("1"));
         assert_eq!(
             sink.events.lock().await[3],
             Event::new(
@@ -264,87 +305,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_completion_is_observable() {
-        let storage = TestStorage::default();
-        let (producer, mut queue, worker) = BoundedQueue::new(2, storage);
+    async fn batch_flushes_when_interval_expires() {
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
 
-        let sink = worker.storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(10, storage, 3);
 
         queue.spawn(worker);
-        let _ = producer
-            .send_event(
-                Event::new(
-                    "1".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
-        let _ = producer
-            .send_event(
-                Event::new(
-                    "2".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
-        let _ = producer
-            .send_event(
-                Event::new(
-                    "3".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
-        let _ = producer
-            .send_event(
-                Event::new(
-                    "4".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
 
-        queue.shutdown().await.unwrap();
+        let producer_a = producer.clone();
+        let task_a = tokio::spawn(async move { producer_a.send_event(mock_event("A")).await });
 
-        assert_eq!(sink.events.lock().await.len(), 4);
-        assert_eq!(
-            sink.events.lock().await[0],
-            Event::new(
-                "1".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            sink.events.lock().await[3],
-            Event::new(
-                "4".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
+        tokio::task::yield_now().await;
+
+        storage_check.wait_until_blocked().await;
+        storage_check.release_first_persist();
+
+        assert!(task_a.await.unwrap().is_ok());
+        assert_eq!(storage_check.events.lock().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_flushes_when_size_is_reached() {
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(10, storage, 3);
+
+        queue.spawn(worker);
+
+        let producer_a = producer.clone();
+        let task_a = tokio::spawn(async move { producer_a.send_event(mock_event("A")).await });
+
+        let producer_b = producer.clone();
+        let task_b = tokio::spawn(async move { producer_b.send_event(mock_event("B")).await });
+
+        let producer_c = producer.clone();
+        let task_c = tokio::spawn(async move { producer_c.send_event(mock_event("C")).await });
+
+        storage_check.wait_until_blocked().await;
+
+        assert!(!task_a.is_finished());
+        assert!(!task_b.is_finished());
+        assert!(!task_c.is_finished());
+
+        storage_check.release_first_persist();
+
+        assert!(task_a.await.unwrap().is_ok());
+        assert!(task_b.await.unwrap().is_ok());
+        assert!(task_c.await.unwrap().is_ok());
+
+        assert_eq!(storage_check.events.lock().await.len(), 3);
     }
 
     #[tokio::test]
@@ -353,27 +364,14 @@ mod tests {
         let storage_check = storage.clone();
 
         // Создаем очередь емкостью 1, чтобы второе событие вызвало блокировку
-        let (producer, mut queue, worker) = BoundedQueue::new(1, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage, 3);
         let producer_a = producer.clone();
         let producer_b = producer.clone();
         let producer_c = producer.clone();
 
         queue.spawn(worker);
 
-        let send_a = tokio::spawn(async move {
-            producer_a
-                .send_event(
-                    Event::new(
-                        "1".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                        12345,
-                        "1".to_string(),
-                    )
-                    .unwrap(),
-                )
-                .await
-        });
+        let send_a = tokio::spawn(async move { producer_a.send_event(mock_event("1")).await });
         storage_check.wait_until_blocked().await;
 
         assert!(
@@ -381,20 +379,7 @@ mod tests {
             "first send must wait for storage acknowledgement"
         );
 
-        let send_b = tokio::spawn(async move {
-            producer_b
-                .send_event(
-                    Event::new(
-                        "2".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                        12345,
-                        "1".to_string(),
-                    )
-                    .unwrap(),
-                )
-                .await
-        });
+        let send_b = tokio::spawn(async move { producer_b.send_event(mock_event("2")).await });
 
         tokio::time::timeout(Duration::from_secs(1), async {
             while producer.tx.capacity() != 0 {
@@ -404,20 +389,7 @@ mod tests {
         .await
         .expect("queue did not become full");
 
-        let mut send_c = tokio::spawn(async move {
-            producer_c
-                .send_event(
-                    Event::new(
-                        "3".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                        12345,
-                        "1".to_string(),
-                    )
-                    .unwrap(),
-                )
-                .await
-        });
+        let mut send_c = tokio::spawn(async move { producer_c.send_event(mock_event("3")).await });
 
         let blocked = tokio::time::timeout(Duration::from_millis(50), &mut send_c).await;
 
@@ -434,34 +406,14 @@ mod tests {
         queue.shutdown().await.unwrap();
 
         assert_eq!(storage_check.events.lock().await.len(), 3);
-        assert_eq!(
-            storage_check.events.lock().await[0],
-            Event::new(
-                "1".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
-        assert_eq!(
-            storage_check.events.lock().await[1],
-            Event::new(
-                "2".to_string(),
-                "1".to_string(),
-                "1".to_string(),
-                12345,
-                "1".to_string()
-            )
-            .unwrap()
-        );
+        assert_eq!(storage_check.events.lock().await[0], mock_event("1"));
+        assert_eq!(storage_check.events.lock().await[1], mock_event("2"));
     }
 
     #[tokio::test]
     async fn shutdown_drains_accepted_events() {
         let storage = TestStorage::default();
-        let (producer, mut queue, worker) = BoundedQueue::new(50, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(50, storage, 3);
 
         let sink = worker.storage.clone();
 
@@ -469,19 +421,7 @@ mod tests {
 
         let len = 100;
         for _ in 1..len {
-            producer
-                .send_event(
-                    Event::new(
-                        "2".to_string(),
-                        "1".to_string(),
-                        "1".to_string(),
-                        12345,
-                        "1".to_string(),
-                    )
-                    .unwrap(),
-                )
-                .await
-                .unwrap();
+            producer.send_event(mock_event("2")).await.unwrap();
         }
         queue.shutdown().await.unwrap();
 
@@ -491,60 +431,27 @@ mod tests {
     #[tokio::test]
     async fn new_work_is_not_accepted_after_shutdown() {
         let storage = TestStorage::default();
-        let (producer, mut queue, worker) = BoundedQueue::new(50, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(50, storage, 3);
 
         queue.spawn(worker);
 
-        let res1 = producer
-            .send_event(
-                Event::new(
-                    "1".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
+        let res1 = producer.send_event(mock_event("1")).await;
         assert!(res1.is_ok(),);
 
         queue.shutdown().await.unwrap();
 
-        let res2 = producer
-            .send_event(
-                Event::new(
-                    "2".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
+        let res2 = producer.send_event(mock_event("2")).await;
         assert!(res2.is_err(),);
     }
 
     #[tokio::test]
     async fn repeated_shutdown_does_not_hang() {
         let storage = TestStorage::default();
-        let (producer, mut queue, worker) = BoundedQueue::new(50, storage);
+        let (producer, mut queue, worker) = BoundedQueue::new(50, storage, 3);
 
         queue.spawn(worker);
 
-        let res1 = producer
-            .send_event(
-                Event::new(
-                    "1".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
+        let res1 = producer.send_event(mock_event("1")).await;
         assert!(res1.is_ok(),);
 
         queue.shutdown().await.unwrap();
@@ -556,7 +463,7 @@ mod tests {
     #[tokio::test]
     async fn shutdown_with_empty_queue() {
         let storage = TestStorage::default();
-        let (_, mut queue, worker) = BoundedQueue::new(50, storage);
+        let (_, mut queue, worker) = BoundedQueue::new(50, storage, 3);
         let sink = worker.storage.clone();
         queue.spawn(worker);
 
@@ -568,23 +475,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn storage_error_does_not_panic_worker() {
-        let (producer, mut queue, worker) = BoundedQueue::new(2, FailingStorage {});
+    async fn batch_failure_returns_error_to_callers() {
+        let (producer, mut queue, worker) = BoundedQueue::new(2, FailingStorage {}, 3);
 
         queue.spawn(worker);
 
-        let result = producer
-            .send_event(
-                Event::new(
-                    "1".to_string(),
-                    "1".to_string(),
-                    "1".to_string(),
-                    12345,
-                    "1".to_string(),
-                )
-                .unwrap(),
-            )
-            .await;
+        let producer_a = producer.clone();
+        let task_a = tokio::spawn(async move { producer_a.send_event(mock_event("A")).await });
+
+        let producer_b = producer.clone();
+        let task_b = tokio::spawn(async move { producer_b.send_event(mock_event("B")).await });
+
+        let producer_c = producer.clone();
+        let task_c = tokio::spawn(async move { producer_c.send_event(mock_event("C")).await });
+
+        let result_a = task_a.await.unwrap();
+        let result_b = task_b.await.unwrap();
+        let result_c = task_c.await.unwrap();
+
+        assert!(matches!(result_a, Err(EventSendError::Storage(_))));
+        assert!(matches!(result_b, Err(EventSendError::Storage(_))));
+        assert!(matches!(result_c, Err(EventSendError::Storage(_))));
+
+        let result = queue.shutdown().await;
+
+        assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn shutdown_flushes_partial_batch() {
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(10, storage, 3);
+
+        queue.spawn(worker);
+
+        let producer_a = producer.clone();
+        let task_a = tokio::spawn(async move { producer_a.send_event(mock_event("A")).await });
+
+        let producer_b = producer.clone();
+        let task_b = tokio::spawn(async move { producer_b.send_event(mock_event("B")).await });
+
+        tokio::task::yield_now().await;
+
+        let shutdown_task = tokio::spawn(async move { queue.shutdown().await });
+
+        storage_check.wait_until_blocked().await;
+        storage_check.release_first_persist();
+
+        let shutdown_res = shutdown_task.await.unwrap();
+        let result_a = task_a.await.unwrap();
+        let result_b = task_b.await.unwrap();
+
+        assert!(shutdown_res.is_ok());
+
+        assert!(result_a.is_ok());
+        assert!(result_b.is_ok());
+
+        assert_eq!(storage_check.events.lock().await.len(), 2);
+        assert_eq!(storage_check.events.lock().await[0], mock_event("A"));
+        assert_eq!(storage_check.events.lock().await[1], mock_event("B"));
+    }
+
+    #[tokio::test]
+    async fn storage_error_does_not_panic_worker() {
+        let (producer, mut queue, worker) = BoundedQueue::new(2, FailingStorage {}, 3);
+
+        queue.spawn(worker);
+
+        let result = producer.send_event(mock_event("1")).await;
 
         assert!(matches!(result, Err(EventSendError::Storage(_))));
 
