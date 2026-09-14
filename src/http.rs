@@ -14,7 +14,7 @@ use tower_http::limit::RequestBodyLimitLayer;
 use crate::{
     domain::{DomainError, Event},
     pipeline::{EventProducer, EventSendError},
-    storage::Storage,
+    storage::{EventOutcome, Storage},
 };
 use serde::{Deserialize, Serialize};
 
@@ -126,6 +126,8 @@ impl IntoResponse for ApiError {
             ApiError::NotFound => StatusCode::NOT_FOUND.into_response(),
 
             ApiError::Internal => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+
+            ApiError::Conflict => StatusCode::CONFLICT.into_response(),
         }
     }
 }
@@ -135,6 +137,7 @@ enum ApiError {
     PipelineUnavailable,
     NotFound,
     Internal,
+    Conflict,
 }
 
 async fn create_event_handler<S>(
@@ -147,7 +150,12 @@ where
     let event: Event = payload.try_into().map_err(ApiError::Domain)?;
 
     return match state.producer.send_event(event).await {
-        Ok(_) => Ok(StatusCode::CREATED),
+        Ok(EventOutcome::Inserted) => Ok(StatusCode::CREATED),
+
+        Ok(EventOutcome::Duplicate) => Ok(StatusCode::OK),
+
+        Ok(EventOutcome::Conflict) => Err(ApiError::Conflict),
+
         Err(EventSendError::QueueClosed | EventSendError::WorkerDropped) => {
             Err(ApiError::PipelineUnavailable)
         }
@@ -612,5 +620,125 @@ mod tests {
         assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
 
         queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn equivalent_retry_returns_200() {
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+        let clone_app = app.clone();
+
+        // 4. Construct the HTTP request
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response = app.oneshot(request).await.unwrap();
+
+        // 6. Assert the response status is 201 CREATED
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // 4. Construct the HTTP request
+        let request2 = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response2 = clone_app.oneshot(request2).await.unwrap();
+
+        // 6. Assert the response status is 200 OK
+        assert_eq!(response2.status(), StatusCode::OK);
+
+        queue.shutdown().await.unwrap();
+
+        assert_eq!(sink.events.lock().await.len(), 1);
+        assert_eq!(
+            sink.events.lock().await[0],
+            Event::new(
+                "evt-123".to_string(),
+                "2".to_string(),
+                "click".to_string(),
+                1700000000,
+                "test".to_string()
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn http_conflict_test() {
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+        let clone_app = app.clone();
+
+        // 4. Construct the HTTP request
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"user-a"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response = app.oneshot(request).await.unwrap();
+
+        // 6. Assert the response status is 201 CREATED
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // 4. Construct the HTTP request
+        let request2 = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"user-2"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response2 = clone_app.oneshot(request2).await.unwrap();
+
+        // Assert the response status is 409 CONFLICT
+        assert_eq!(response2.status(), StatusCode::CONFLICT);
+
+        queue.shutdown().await.unwrap();
+
+        assert_eq!(sink.events.lock().await.len(), 1);
+        assert_eq!(
+            sink.events.lock().await[0],
+            Event::new(
+                "evt-123".to_string(),
+                "2".to_string(),
+                "click".to_string(),
+                1700000000,
+                "user-a".to_string()
+            )
+            .unwrap()
+        );
     }
 }

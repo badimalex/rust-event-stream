@@ -70,7 +70,8 @@ timestamp
 payload
 ```
 
-Successful requests return:
+Idempotency: new `event_id` → `201 Inserted`; same ID + same data → `200 Duplicate`; same ID + different data → `409 Conflict`.
+
 
 ```text
 201 Created

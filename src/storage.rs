@@ -4,9 +4,18 @@ use crate::domain::Event;
 
 #[derive(Debug)]
 pub enum StorageError {
+    Database(sqlx::Error),
+    ContractViolation(String),
+
     #[cfg(test)]
     Unavailable(String),
-    Database(sqlx::Error),
+}
+
+#[derive(Debug, PartialEq)]
+pub enum EventOutcome {
+    Inserted,
+    Duplicate,
+    Conflict,
 }
 
 impl std::fmt::Display for StorageError {
@@ -16,6 +25,7 @@ impl std::fmt::Display for StorageError {
 
             #[cfg(test)]
             StorageError::Unavailable(msg) => write!(f, "Storage Unavailable: {msg}"),
+            StorageError::ContractViolation(msg) => write!(f, "Contract Violation: {msg}"),
         }
     }
 }
@@ -31,7 +41,7 @@ pub trait Storage: Send + Sync {
     fn persist<'a>(
         &'a self,
         events: &'a [Event],
-    ) -> impl Future<Output = Result<(), StorageError>> + Send + 'a;
+    ) -> impl Future<Output = Result<Vec<EventOutcome>, StorageError>> + Send + 'a;
 
     fn get_by_id<'a>(
         &'a self,
@@ -51,19 +61,25 @@ impl PostgresStorage {
 }
 
 impl Storage for PostgresStorage {
-    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
+    async fn persist(&self, events: &[Event]) -> Result<Vec<EventOutcome>, StorageError> {
         if events.is_empty() {
-            return Ok(());
+            return Ok(vec![]);
         }
 
-        // Собираем векторы для каждого поля, чтобы передать их как массивы
-        let mut event_ids = Vec::with_capacity(events.len());
-        let mut tenant_ids = Vec::with_capacity(events.len());
-        let mut event_types = Vec::with_capacity(events.len());
-        let mut event_timestamps = Vec::with_capacity(events.len());
-        let mut payloads = Vec::with_capacity(events.len());
+        let mut seen = HashSet::with_capacity(events.len());
 
-        for event in events {
+        let candidates: Vec<&Event> = events
+            .iter()
+            .filter(|event| seen.insert(event.event_id.as_str()))
+            .collect();
+
+        let mut event_ids = Vec::with_capacity(candidates.len());
+        let mut tenant_ids = Vec::with_capacity(candidates.len());
+        let mut event_types = Vec::with_capacity(candidates.len());
+        let mut event_timestamps = Vec::with_capacity(candidates.len());
+        let mut payloads = Vec::with_capacity(candidates.len());
+
+        for event in &candidates {
             event_ids.push(&event.event_id);
             tenant_ids.push(&event.tenant_id);
             event_types.push(&event.event_type);
@@ -71,21 +87,94 @@ impl Storage for PostgresStorage {
             payloads.push(&event.payload);
         }
 
-        sqlx::query(
+        let mut tx = self.pool.begin().await?;
+
+        let inserted_ids: Vec<String> = sqlx::query_scalar(
             r#"
-        INSERT INTO events (event_id, tenant_id, event_type, event_timestamp, payload)
-        SELECT * FROM UNNEST($1, $2, $3, $4, $5::jsonb[])
-        "#,
+                INSERT INTO events (event_id, tenant_id, event_type, event_timestamp, payload)
+                SELECT * FROM UNNEST($1, $2, $3, $4, $5::jsonb[])
+                ON CONFLICT (event_id) DO NOTHING
+                RETURNING event_id
+                "#,
         )
         .bind(&event_ids)
         .bind(&tenant_ids)
         .bind(&event_types)
         .bind(&event_timestamps)
         .bind(&payloads)
-        .execute(&self.pool)
+        .fetch_all(&mut *tx)
+        .await?;
+        let inserted_ids: HashSet<String> = inserted_ids.into_iter().collect();
+
+        let not_inserted_ids: Vec<&String> = event_ids
+            .iter()
+            .copied()
+            .filter(|id| !inserted_ids.contains(id.as_str()))
+            .collect();
+        let rows = sqlx::query(
+            r#"
+                SELECT event_id, tenant_id, event_type, event_timestamp, payload
+                FROM events
+                WHERE event_id = ANY($1)
+            "#,
+        )
+        .bind(&not_inserted_ids)
+        .fetch_all(&mut *tx)
         .await?;
 
-        Ok(())
+        let existing_events: Vec<Event> = rows
+            .into_iter()
+            .map(|r| Event {
+                event_id: r.get("event_id"),
+                tenant_id: r.get("tenant_id"),
+                event_type: r.get("event_type"),
+                event_timestamp: r.get::<i64, _>("event_timestamp") as u64,
+                payload: r.get("payload"),
+            })
+            .collect();
+
+        let existing_by_id: HashMap<String, Event> = existing_events
+            .into_iter()
+            .map(|event| (event.event_id.clone(), event))
+            .collect();
+
+        let mut outcomes = Vec::with_capacity(events.len());
+
+        let mut first_index_by_id = HashMap::with_capacity(events.len());
+
+        for (index, event) in events.iter().enumerate() {
+            first_index_by_id
+                .entry(event.event_id.as_str())
+                .or_insert(index);
+        }
+
+        for (index, event) in events.iter().enumerate() {
+            if inserted_ids.contains(&event.event_id) {
+                let first_index = first_index_by_id[event.event_id.as_str()];
+                let canonical = &events[first_index];
+
+                if !same_event(canonical, event) {
+                    outcomes.push(EventOutcome::Conflict);
+                } else if index == first_index {
+                    outcomes.push(EventOutcome::Inserted);
+                } else {
+                    outcomes.push(EventOutcome::Duplicate);
+                }
+            } else {
+                let existing = existing_by_id
+                    .get(&event.event_id)
+                    .expect("existing row must exist");
+
+                if same_event(existing, event) {
+                    outcomes.push(EventOutcome::Duplicate);
+                } else {
+                    outcomes.push(EventOutcome::Conflict);
+                }
+            }
+        }
+
+        tx.commit().await?;
+        Ok(outcomes)
     }
 
     /*async fn persist(&self, event: &Event) -> Result<(), StorageError> {
@@ -130,6 +219,13 @@ impl Storage for PostgresStorage {
     }
 }
 
+fn same_event(a: &Event, b: &Event) -> bool {
+    a.tenant_id == b.tenant_id
+        && a.event_type == b.event_type
+        && a.event_timestamp == b.event_timestamp
+        && a.payload == b.payload
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +236,16 @@ mod tests {
             event_type: "user.signed_up".to_string(),
             event_timestamp: 1700000000,
             payload: serde_json::json!({"user_id": 42}),
+        }
+    }
+
+    fn mock_event_user(id: &str, user_id: &str) -> Event {
+        Event {
+            event_id: id.to_string(),
+            tenant_id: "tenant-123".to_string(),
+            event_type: "user.signed_up".to_string(),
+            event_timestamp: 1700000000,
+            payload: serde_json::json!({"user_id": user_id}),
         }
     }
 
@@ -225,29 +331,229 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn test_duplicate_event_id_is_rejected(pool: sqlx::PgPool) {
+    async fn same_event_retry_does_not_create_second_record(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+        let event = mock_event("evt_new");
+
+        let result = storage.persist(&[event]).await;
+        assert!(result.is_ok());
+
+        let event_2 = mock_event("evt_new"); // Тот же ID
+
+        let result = storage.persist(&[event_2]).await;
+
+        assert!(result.is_ok());
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_id = $1")
+            .bind("evt_new")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Scenario 2 failed: Count must still be 1 after inserting exact duplicate"
+        );
+    }
+
+    #[sqlx::test]
+    async fn test_persist_conflict_duplicate_returns_error_and_does_not_modify(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+        let event = mock_event_user("evt_new_1", "first");
+
+        let result = storage.persist(&[event]).await;
+        assert!(result.is_ok());
+
+        let event_2 = mock_event_user("evt_new_1", "999");
+
+        let result = storage.persist(&[event_2]).await.unwrap();
+
+        assert_eq!(result, vec![EventOutcome::Conflict]);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_id = $1")
+            .bind("evt_new_1")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 1, "Count must remain 1 after conflicting duplicate");
+
+        let event = sqlx::query!(
+            "SELECT payload FROM events WHERE event_id = $1",
+            "evt_new_1"
+        )
+        .fetch_one(&storage.pool)
+        .await
+        .unwrap();
+
+        assert_eq!(event.payload, serde_json::json!({"user_id": "first"}));
+    }
+
+    #[sqlx::test]
+    async fn duplicate_inside_batch_is_handled(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+        let event1 = mock_event("evt_A");
+        let event2 = mock_event("evt_A");
+
+        let result = storage.persist(&[event1, event2]).await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            result.unwrap(),
+            vec![EventOutcome::Inserted, EventOutcome::Duplicate]
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events WHERE event_id = $1")
+            .bind("evt_A")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Scenario 2 failed: Count must still be 1 after inserting exact duplicate"
+        );
+    }
+
+    #[sqlx::test]
+    async fn mixed_batch_with_conflict(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+        let event = mock_event_user("A", "OLD");
+
+        let result = storage.persist(&[event]).await;
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), vec![EventOutcome::Inserted]);
+
+        let event_2 = mock_event_user("B", "NEW");
+        let event_3 = mock_event_user("A", "NEW");
+        let event_4 = mock_event_user("C", "NEW");
+
+        let result = storage.persist(&[event_2, event_3, event_4]).await.unwrap();
+
+        assert_eq!(
+            result,
+            vec![
+                EventOutcome::Inserted,
+                EventOutcome::Conflict,
+                EventOutcome::Inserted
+            ]
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(count, 3, "Count must remain 3 after conflicting duplicate");
+
+        let stored_a = storage.get_by_id("A").await.unwrap().unwrap();
+
+        assert_eq!(stored_a, mock_event_user("A", "OLD"));
+        assert!(storage.get_by_id("B").await.unwrap().is_some());
+        assert!(storage.get_by_id("C").await.unwrap().is_some());
+    }
+
+    #[sqlx::test]
+    async fn duplicate_does_not_fail_unrelated_valid_event(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+        let event1 = mock_event("evt_A");
+
+        let result = storage.persist(&[event1]).await.unwrap();
+        assert_eq!(result, vec![EventOutcome::Inserted]);
+
+        let event2 = mock_event("evt_B");
+        let event3 = mock_event("evt_A");
+        let event4 = mock_event("evt_C");
+
+        let result = storage.persist(&[event2, event3, event4]).await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                EventOutcome::Inserted,
+                EventOutcome::Duplicate,
+                EventOutcome::Inserted,
+            ]
+        );
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 3,
+            "Scenario 2 failed: Count must still be 3 after inserting exact duplicate"
+        );
+    }
+
+    #[sqlx::test]
+    async fn duplicate_and_conflict_inside_same_batch_are_classified(pool: sqlx::PgPool) {
         let storage = PostgresStorage::new(pool);
 
-        let event_1 = mock_event("event-3");
-        let event_2 = mock_event("event-3"); // Тот же ID
+        let event2 = mock_event_user("evt_B", "user1");
+        let event3 = mock_event_user("evt_B", "user1");
+        let event4 = mock_event_user("evt_B", "user2");
 
-        // Первый раз сохраняется успешно
-        storage
-            .persist(std::slice::from_ref(&event_1))
+        let result = storage.persist(&[event2, event3, event4]).await;
+        assert!(result.is_ok());
+
+        assert_eq!(
+            result.unwrap(),
+            vec![
+                EventOutcome::Inserted,
+                EventOutcome::Duplicate,
+                EventOutcome::Conflict,
+            ]
+        );
+
+        let stored = sqlx::query!("SELECT payload FROM events WHERE event_id = $1", "evt_B")
+            .fetch_one(&storage.pool)
             .await
             .unwrap();
 
-        // Второй раз ожидаем ошибку дублирования
-        let result = storage.persist(std::slice::from_ref(&event_2)).await;
+        assert_eq!(stored.payload, serde_json::json!({"user_id": "user1"}));
+    }
 
-        assert!(result.is_err());
-        // match result.unwrap_err() {
-        //     StorageError::DuplicateKey(_) => {} // Тест пройден успешно
-        //     other => panic!("Ожидалась ошибка DuplicateKey, но получена: {:?}", other),
-        // }
+    #[sqlx::test]
+    async fn concurrent_duplicate_requests_create_one_logical_record(pool: sqlx::PgPool) {
+        let storage = PostgresStorage::new(pool);
+
+        let mut tasks = Vec::new();
+
+        for _ in 0..10 {
+            let clone_storage = storage.clone();
+            tasks.push(tokio::spawn(async move {
+                clone_storage.persist(&[mock_event("evt_concurrent")]).await
+            }));
+        }
+
+        let mut inserted_count = 0;
+        let mut duplicate_count = 0;
+        let mut conflict_count = 0;
+
+        for task in tasks {
+            let result = task.await.unwrap().unwrap();
+            assert_eq!(result.len(), 1);
+
+            match &result[0] {
+                EventOutcome::Inserted => inserted_count += 1,
+                EventOutcome::Duplicate => duplicate_count += 1,
+                EventOutcome::Conflict => conflict_count += 1,
+            }
+        }
+        assert_eq!(inserted_count, 1);
+        assert_eq!(duplicate_count, 9);
+        assert_eq!(conflict_count, 0);
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM events")
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            count, 1,
+            "Scenario 2 failed: Count must still be 1 after inserting exact duplicate"
+        );
     }
 }
 
+use std::collections::{HashMap, HashSet};
 #[cfg(test)]
 use std::sync::Arc;
 #[cfg(test)]
@@ -270,7 +576,7 @@ pub(crate) struct BlockingStorage {
 
 #[cfg(test)]
 impl Storage for BlockingStorage {
-    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
+    async fn persist(&self, events: &[Event]) -> Result<Vec<EventOutcome>, StorageError> {
         let is_first = {
             let mut calls = self.persist_calls.lock().await;
             let is_first = *calls == 0;
@@ -284,8 +590,9 @@ impl Storage for BlockingStorage {
         }
 
         self.events.lock().await.extend_from_slice(events);
+        let outcomes = events.iter().map(|_| EventOutcome::Inserted).collect();
 
-        Ok(())
+        Ok(outcomes)
     }
 
     async fn get_by_id(&self, event_id: &str) -> Result<Option<Event>, StorageError> {
@@ -315,7 +622,7 @@ pub(crate) struct FailingStorage {}
 
 #[cfg(test)]
 impl Storage for FailingStorage {
-    async fn persist(&self, _event: &[Event]) -> Result<(), StorageError> {
+    async fn persist(&self, _event: &[Event]) -> Result<Vec<EventOutcome>, StorageError> {
         Err(StorageError::Unavailable("forced test failure".to_string()))
     }
 
@@ -326,10 +633,25 @@ impl Storage for FailingStorage {
 
 #[cfg(test)]
 impl Storage for TestStorage {
-    async fn persist(&self, events: &[Event]) -> Result<(), StorageError> {
-        self.events.lock().await.extend_from_slice(events);
+    async fn persist(&self, events: &[Event]) -> Result<Vec<EventOutcome>, StorageError> {
+        let mut outcomes = Vec::with_capacity(events.len());
+        let mut stored = self.events.lock().await;
+        for event in events {
+            match stored.iter().find(|saved| saved.event_id == event.event_id) {
+                None => {
+                    stored.push(event.clone());
+                    outcomes.push(EventOutcome::Inserted);
+                }
+                Some(saved) if saved == event => {
+                    outcomes.push(EventOutcome::Duplicate);
+                }
+                Some(_) => {
+                    outcomes.push(EventOutcome::Conflict);
+                }
+            }
+        }
 
-        Ok(())
+        Ok(outcomes)
     }
 
     async fn get_by_id(&self, event_id: &str) -> Result<Option<Event>, StorageError> {

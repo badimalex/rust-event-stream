@@ -7,9 +7,9 @@ use tokio::task::{JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
 
 use crate::domain::Event;
-use crate::storage::{Storage, StorageError};
+use crate::storage::{EventOutcome, Storage, StorageError};
 
-type ReplyTx = tokio::sync::oneshot::Sender<Result<(), Arc<StorageError>>>;
+type ReplyTx = tokio::sync::oneshot::Sender<Result<EventOutcome, Arc<StorageError>>>;
 
 struct PersistRequest {
     event: Event,
@@ -29,7 +29,7 @@ pub enum EventSendError {
 }
 
 impl EventProducer {
-    pub async fn send_event(&self, event: Event) -> Result<(), EventSendError> {
+    pub async fn send_event(&self, event: Event) -> Result<EventOutcome, EventSendError> {
         let (reply_to, ack_rx) = oneshot::channel();
 
         let request = PersistRequest { event, reply_to };
@@ -40,7 +40,7 @@ impl EventProducer {
             .map_err(|_| EventSendError::QueueClosed)?;
 
         match ack_rx.await {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(outcome)) => Ok(outcome),
 
             Ok(Err(error)) => Err(EventSendError::Storage(error)),
 
@@ -186,9 +186,23 @@ where
 
         let result = self.storage.persist(&events).await;
         match result {
-            Ok(_) => {
-                for reply_to in reply_tos {
-                    let _ = reply_to.send(Ok(()));
+            Ok(outcomes) => {
+                if outcomes.len() != reply_tos.len() {
+                    let error = Arc::new(StorageError::ContractViolation(format!(
+                        "storage contract violation: expected {} outcomes, got {}",
+                        reply_tos.len(),
+                        outcomes.len()
+                    )));
+
+                    for reply_to in reply_tos {
+                        let _ = reply_to.send(Err(Arc::clone(&error)));
+                    }
+
+                    return;
+                }
+
+                for (reply_to, outcome) in reply_tos.into_iter().zip(outcomes) {
+                    let _ = reply_to.send(Ok(outcome));
                 }
             }
             Err(error) => {
@@ -420,8 +434,11 @@ mod tests {
         queue.spawn(worker);
 
         let len = 100;
-        for _ in 1..len {
-            producer.send_event(mock_event("2")).await.unwrap();
+        for i in 1..len {
+            producer
+                .send_event(mock_event(&i.to_string()))
+                .await
+                .unwrap();
         }
         queue.shutdown().await.unwrap();
 
