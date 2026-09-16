@@ -43,6 +43,9 @@ pub trait Storage: Send + Sync {
         events: &'a [Event],
     ) -> impl Future<Output = Result<Vec<EventOutcome>, StorageError>> + Send + 'a;
 
+    // fn health_check(&self) -> Result<(), StorageError>;
+    fn health_check<'a>(&'a self) -> impl Future<Output = Result<(), StorageError>> + Send + 'a;
+
     fn get_by_id<'a>(
         &'a self,
         event_id: &'a str,
@@ -177,6 +180,11 @@ impl Storage for PostgresStorage {
         Ok(outcomes)
     }
 
+    async fn health_check(&self) -> Result<(), StorageError> {
+        let _: i32 = sqlx::query_scalar("SELECT 1").fetch_one(&self.pool).await?;
+
+        Ok(())
+    }
     /*async fn persist(&self, event: &Event) -> Result<(), StorageError> {
         sqlx::query(
             r#"
@@ -551,6 +559,37 @@ mod tests {
             "Scenario 2 failed: Count must still be 1 after inserting exact duplicate"
         );
     }
+
+    #[sqlx::test]
+    async fn pool_exhaustion_times_out_and_recovers(pool: sqlx::PgPool) {
+        use sqlx::postgres::PgPoolOptions;
+        use std::time::Duration;
+
+        let connect_options = (*pool.connect_options()).clone();
+
+        let tiny_pool = PgPoolOptions::new()
+            .max_connections(1)
+            .acquire_timeout(Duration::from_millis(100))
+            .connect_with(connect_options)
+            .await
+            .unwrap();
+
+        let storage = PostgresStorage::new(tiny_pool.clone());
+        let held_connection = tiny_pool.acquire().await.unwrap();
+
+        let result = storage.get_by_id("anything").await;
+
+        assert!(matches!(
+            result,
+            Err(StorageError::Database(sqlx::Error::PoolTimedOut))
+        ));
+
+        drop(held_connection);
+
+        let res2 = storage.get_by_id("anything").await;
+
+        assert_eq!(res2.unwrap(), None);
+    }
 }
 
 use std::collections::{HashMap, HashSet};
@@ -603,6 +642,10 @@ impl Storage for BlockingStorage {
             .find(|event| event.event_id == event_id)
             .cloned())
     }
+
+    async fn health_check(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -618,6 +661,25 @@ impl BlockingStorage {
 
 #[cfg(test)]
 #[derive(Clone, Default)]
+pub(crate) struct PanicStorage {}
+
+#[cfg(test)]
+impl Storage for PanicStorage {
+    async fn persist(&self, _events: &[Event]) -> Result<Vec<EventOutcome>, StorageError> {
+        panic!("forced worker panic");
+    }
+
+    async fn get_by_id(&self, _event_id: &str) -> Result<Option<Event>, StorageError> {
+        Ok(None)
+    }
+
+    async fn health_check(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+#[derive(Clone, Default)]
 pub(crate) struct FailingStorage {}
 
 #[cfg(test)]
@@ -627,6 +689,10 @@ impl Storage for FailingStorage {
     }
 
     async fn get_by_id(&self, _event_id: &str) -> Result<Option<Event>, StorageError> {
+        Err(StorageError::Unavailable("forced test failure".to_string()))
+    }
+
+    async fn health_check(&self) -> Result<(), StorageError> {
         Err(StorageError::Unavailable("forced test failure".to_string()))
     }
 }
@@ -661,5 +727,9 @@ impl Storage for TestStorage {
             .iter()
             .find(|event| event.event_id == event_id)
             .cloned())
+    }
+
+    async fn health_check(&self) -> Result<(), StorageError> {
+        Ok(())
     }
 }

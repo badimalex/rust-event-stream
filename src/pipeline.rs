@@ -47,10 +47,14 @@ impl EventProducer {
             Err(_) => Err(EventSendError::WorkerDropped),
         }
     }
+
+    pub fn is_closed(&self) -> bool {
+        self.tx.is_closed()
+    }
 }
 
 pub struct BoundedQueue {
-    cancel_token: CancellationToken,
+    pub cancel_token: CancellationToken,
     worker_handle: Option<JoinHandle<()>>,
 }
 
@@ -219,7 +223,7 @@ where
 mod tests {
     use std::time::Duration;
 
-    use crate::storage::{BlockingStorage, FailingStorage, TestStorage};
+    use crate::storage::{BlockingStorage, FailingStorage, PanicStorage, TestStorage};
 
     use super::*;
     fn mock_event(id: &str) -> Event {
@@ -568,5 +572,29 @@ mod tests {
         let result = queue.shutdown().await;
 
         assert!(result.is_ok());
+    }
+
+    #[tokio::test]
+    async fn worker_failure_is_observable() {
+        let (producer, mut queue, worker) = BoundedQueue::new(1, PanicStorage {}, 1);
+
+        queue.spawn(worker);
+
+        // Это событие успевает попасть worker'у.
+        // Worker входит в persist() и паникует.
+        let first = producer.send_event(mock_event("1")).await;
+
+        assert!(matches!(first, Err(EventSendError::WorkerDropped)));
+
+        // Worker уже умер, receiver mpsc уничтожен.
+        let second = producer.send_event(mock_event("2")).await;
+
+        assert!(matches!(second, Err(EventSendError::QueueClosed)));
+
+        // JoinHandle обязан показать, что worker завершился panic'ом.
+        let shutdown_result = queue.shutdown().await;
+
+        let join_error = shutdown_result.expect_err("worker panic must be observable");
+        assert!(join_error.is_panic());
     }
 }

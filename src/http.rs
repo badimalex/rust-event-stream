@@ -8,6 +8,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
 
@@ -25,6 +26,7 @@ where
 {
     pub producer: EventProducer,
     pub storage: S,
+    pub shutdown: CancellationToken,
 }
 
 pub fn build_router<S>(state: AppState<S>) -> Router
@@ -45,7 +47,7 @@ where
 
     Router::new()
         .route("/health", get(health))
-        .route("/ready", get(ready))
+        .route("/ready", get(ready::<S>))
         .merge(api_router)
         .with_state(state)
 }
@@ -187,15 +189,30 @@ async fn health() -> &'static str {
     "ok"
 }
 
-async fn ready() -> &'static str {
-    "ok"
+async fn ready<S>(State(state): State<AppState<S>>) -> StatusCode
+where
+    S: Storage + Clone,
+{
+    if state.shutdown.is_cancelled() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    if state.producer.is_closed() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    if state.storage.health_check().await.is_err() {
+        return StatusCode::SERVICE_UNAVAILABLE;
+    }
+
+    StatusCode::OK
 }
 
 #[cfg(test)]
 mod tests {
     use crate::{
         pipeline::BoundedQueue,
-        storage::{BlockingStorage, FailingStorage, TestStorage},
+        storage::{BlockingStorage, FailingStorage, PanicStorage, TestStorage},
     };
 
     use super::*;
@@ -211,10 +228,11 @@ mod tests {
     async fn oversized_body_is_rejected() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
+        let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         let app = build_router(shared_state);
@@ -242,7 +260,11 @@ mod tests {
 
         queue.spawn(worker);
 
-        let shared_state = AppState { producer, storage };
+        let shared_state = AppState {
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
 
         let app = build_router(shared_state);
 
@@ -273,6 +295,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage.clone(),
+            shutdown: queue.cancel_token.clone(),
         };
 
         let app = build_router(shared_state);
@@ -340,10 +363,11 @@ mod tests {
     async fn health_returns_success() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
+        let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
         let app = build_router(shared_state);
 
@@ -362,11 +386,15 @@ mod tests {
     async fn ready_returns_success() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
+
+        queue.spawn(worker);
+
         let app = build_router(shared_state);
 
         let request = Request::builder()
@@ -381,13 +409,174 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_json_is_rejected() {
-        let storage = TestStorage::default();
+    async fn readiness_is_503_when_storage_is_unavailable() {
+        let storage = FailingStorage::default();
+
         let storage_clone = storage.clone();
-        let (producer, _, _) = BoundedQueue::new(100, storage, 3);
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 200 OK
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app_clone.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn readiness_is_503_when_worker_is_panic() {
+        let storage = PanicStorage::default();
+
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+        let app_clone2 = app.clone();
+
+        // 4. Construct the HTTP request
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response = app.oneshot(request).await.unwrap();
+
+        // 6. Assert the response status is 503
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app_clone.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 503
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app_clone2.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let res_shutdown = queue.shutdown().await.unwrap_err();
+        assert!(res_shutdown.is_panic());
+    }
+
+    #[tokio::test]
+    async fn readiness_is_503_when_shutdown_token_cancelled() {
+        let storage = TestStorage::default();
+
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+        let app_clone2 = app.clone();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 503
+        assert_eq!(response.status(), StatusCode::OK);
+
+        queue.cancel_token.cancel();
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/ready")
+            .body(Body::empty())
+            .unwrap();
+
+        // 4. Send the request to the router using `oneshot`
+        let response = app_clone.oneshot(request).await.unwrap();
+
+        // 5. Assert the response status is 503
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/health")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app_clone2.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        queue.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_json_is_rejected() {
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
         let app = build_router(shared_state);
 
@@ -412,6 +601,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -455,6 +645,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         drop(worker);
@@ -486,6 +677,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
         queue.spawn(worker);
 
@@ -526,6 +718,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -568,6 +761,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -600,6 +794,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -631,6 +826,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -691,6 +887,7 @@ mod tests {
         let shared_state = AppState {
             producer,
             storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
         };
 
         queue.spawn(worker);
@@ -737,6 +934,104 @@ mod tests {
                 "click".to_string(),
                 1700000000,
                 "user-a".to_string()
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn client_cancelation() {
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone(), 3);
+
+        queue.spawn(worker);
+
+        let shared_state = AppState {
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        let app = build_router(shared_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        storage_check.wait_until_blocked().await;
+        response_task.abort();
+
+        let err = response_task.await.unwrap_err();
+        assert!(err.is_cancelled());
+
+        storage_check.release_first_persist();
+
+        queue.shutdown().await.unwrap();
+        assert_eq!(sink.events.lock().await.len(), 1);
+        assert_eq!(
+            sink.events.lock().await[0],
+            Event::new(
+                "evt-12341".to_string(),
+                "2".to_string(),
+                "click".to_string(),
+                1700000000,
+                "test".to_string()
+            )
+            .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_does_not_lose_accepted_batch() {
+        let storage = BlockingStorage::default();
+        let storage_check = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone(), 3);
+
+        queue.spawn(worker);
+
+        let shared_state = AppState {
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        let app = build_router(shared_state);
+
+        let request = axum::http::Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+        storage_check.wait_until_blocked().await;
+
+        let shutdown_task = tokio::spawn(async move { queue.shutdown().await.unwrap() });
+        assert!(!shutdown_task.is_finished());
+        storage_check.release_first_persist();
+
+        let response = response_task.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+        shutdown_task.await.unwrap();
+
+        assert_eq!(sink.events.lock().await.len(), 1);
+        assert_eq!(
+            sink.events.lock().await[0],
+            Event::new(
+                "evt-12341".to_string(),
+                "2".to_string(),
+                "click".to_string(),
+                1700000000,
+                "test".to_string()
             )
             .unwrap()
         );
