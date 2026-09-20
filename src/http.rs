@@ -2,12 +2,29 @@ use std::time::Duration;
 
 use axum::{
     BoxError, Json, Router,
+    body::Body,
     error_handling::HandleErrorLayer,
+    extract::MatchedPath,
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+
+// use axum::{
+//     body::{to_bytes, Body},
+//     http::{Request, StatusCode},
+// };
+// use tower::ServiceExt;
+
+use metrics::{counter, histogram};
+use metrics_exporter_prometheus::PrometheusHandle;
+
+use tokio::time::Instant;
+use tracing::{Instrument, info, info_span, warn};
+use uuid::Uuid;
+
 use tokio_util::sync::CancellationToken;
 use tower::ServiceBuilder;
 use tower_http::limit::RequestBodyLimitLayer;
@@ -19,6 +36,12 @@ use crate::{
 };
 use serde::{Deserialize, Serialize};
 
+#[cfg(test)]
+use std::sync::OnceLock;
+
+#[cfg(test)]
+static TEST_METRICS: OnceLock<PrometheusHandle> = OnceLock::new();
+
 #[derive(Clone)]
 pub struct AppState<S>
 where
@@ -27,6 +50,7 @@ where
     pub producer: EventProducer,
     pub storage: S,
     pub shutdown: CancellationToken,
+    pub metrics: PrometheusHandle,
 }
 
 pub fn build_router<S>(state: AppState<S>) -> Router
@@ -43,13 +67,74 @@ where
                 .load_shed()
                 .concurrency_limit(100)
                 .timeout(Duration::from_secs(5)),
-        );
+        )
+        .layer(middleware::from_fn(trace_request_middleware));
 
     Router::new()
+        .route("/metrics", get(metrics))
         .route("/health", get(health))
         .route("/ready", get(ready::<S>))
         .merge(api_router)
         .with_state(state)
+}
+
+// 3. Кастомный Middleware, выполняющий контракт
+async fn trace_request_middleware(req: Request<Body>, next: Next) -> Response<Body> {
+    // Шаг 1: Генерируем уникальный request_id
+    let start = Instant::now();
+    let request_id = Uuid::new_v4().to_string();
+
+    // Шаг 2: Получаем HTTP метод и route (MatchedPath)
+    let method = req.method().to_string();
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_else(|| req.uri().path().to_string());
+
+    let span = info_span!(
+        "http_request",
+        request_id = %request_id,
+        method = %method,
+        route = %route,
+    );
+
+    let mut response = async {
+        info!("request started");
+
+        let response = next.run(req).await;
+
+        info!(status = response.status().as_u16(), "request completed");
+
+        let status = response.status().as_u16().to_string();
+
+        counter!(
+            "http_requests_total",
+            "status" => status
+        )
+        .increment(1);
+
+        response
+    }
+    .instrument(span)
+    .await;
+
+    // Шаг 5: Добавляем x-request-id в заголовки ответа
+    if let Ok(header_value) = request_id.parse() {
+        response.headers_mut().insert("x-request-id", header_value);
+    }
+
+    let elapsed = start.elapsed().as_secs_f64();
+    histogram!("http_request_duration_seconds").record(elapsed);
+
+    response
+}
+
+async fn metrics<S>(State(state): State<AppState<S>>) -> String
+where
+    S: Storage + Clone + 'static,
+{
+    state.metrics.render()
 }
 
 async fn handle_middleware_errors(err: BoxError) -> (StatusCode, String) {
@@ -149,20 +234,41 @@ async fn create_event_handler<S>(
 where
     S: Storage + Clone + 'static,
 {
-    let event: Event = payload.try_into().map_err(ApiError::Domain)?;
+    let event: Event = match payload.try_into() {
+        Ok(event) => event,
+        Err(error) => {
+            counter!("events_rejected_total").increment(1);
+            return Err(ApiError::Domain(error));
+        }
+    };
 
+    counter!("events_received_total").increment(1);
     return match state.producer.send_event(event).await {
-        Ok(EventOutcome::Inserted) => Ok(StatusCode::CREATED),
+        Ok(EventOutcome::Inserted) => {
+            counter!("events_persisted_total").increment(1);
+            Ok(StatusCode::CREATED)
+        }
 
         Ok(EventOutcome::Duplicate) => Ok(StatusCode::OK),
 
-        Ok(EventOutcome::Conflict) => Err(ApiError::Conflict),
+        Ok(EventOutcome::Conflict) => {
+            counter!("events_rejected_total").increment(1);
+            Err(ApiError::Conflict)
+        }
 
         Err(EventSendError::QueueClosed | EventSendError::WorkerDropped) => {
+            counter!("events_rejected_total").increment(1);
             Err(ApiError::PipelineUnavailable)
         }
+
         Err(EventSendError::Storage(error)) => {
-            eprintln!("storage error while creating event: {error}");
+            counter!("events_rejected_total").increment(1);
+
+            tracing::error!(
+                error = %error,
+                "storage error while creating event"
+            );
+
             Err(ApiError::Internal)
         }
     };
@@ -179,7 +285,7 @@ where
         Ok(Some(event)) => Ok(Json(event)),
         Ok(None) => Err(ApiError::NotFound),
         Err(error) => {
-            eprintln!("storage error: {error}");
+            tracing::error!(error = %error, "storage error");
             Err(ApiError::Internal)
         }
     }
@@ -194,14 +300,17 @@ where
     S: Storage + Clone,
 {
     if state.shutdown.is_cancelled() {
+        warn!(reason = "app shut down", "readiness failure");
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
     if state.producer.is_closed() {
+        warn!(reason = "producer error", "readiness failure");
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
-    if state.storage.health_check().await.is_err() {
+    if let Err(error) = state.storage.health_check().await {
+        warn!(reason = "storage error", error = %error, "readiness failure");
         return StatusCode::SERVICE_UNAVAILABLE;
     }
 
@@ -218,18 +327,31 @@ mod tests {
     use super::*;
 
     use axum::{
-        body::Body,
+        body::{Body, to_bytes},
         http::{Request, StatusCode},
     };
+    use metrics_exporter_prometheus::PrometheusBuilder;
     use tokio::task::JoinSet;
     use tower::util::ServiceExt;
+
+    fn test_metrics_handle() -> PrometheusHandle {
+        TEST_METRICS
+            .get_or_init(|| {
+                PrometheusBuilder::new()
+                    .install_recorder()
+                    .expect("failed to install test metrics recorder")
+            })
+            .clone()
+    }
 
     #[tokio::test]
     async fn oversized_body_is_rejected() {
         let storage = TestStorage::default();
         let storage_clone = storage.clone();
         let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
+
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -261,6 +383,7 @@ mod tests {
         queue.spawn(worker);
 
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage,
             shutdown: queue.cancel_token.clone(),
@@ -293,6 +416,7 @@ mod tests {
         queue.spawn(worker);
 
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage.clone(),
             shutdown: queue.cancel_token.clone(),
@@ -365,6 +489,7 @@ mod tests {
         let storage_clone = storage.clone();
         let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -388,6 +513,7 @@ mod tests {
         let storage_clone = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -416,6 +542,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -459,6 +586,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -518,6 +646,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -574,6 +703,7 @@ mod tests {
         let storage_clone = storage.clone();
         let (producer, queue, _) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -599,6 +729,7 @@ mod tests {
         let sink = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -643,6 +774,7 @@ mod tests {
         let storage_clone = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -675,6 +807,7 @@ mod tests {
         let sink = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -716,6 +849,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -759,6 +893,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -792,6 +927,7 @@ mod tests {
 
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -824,6 +960,7 @@ mod tests {
         let sink = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -885,6 +1022,7 @@ mod tests {
         let sink = storage.clone();
         let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
@@ -949,6 +1087,7 @@ mod tests {
         queue.spawn(worker);
 
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage,
             shutdown: queue.cancel_token.clone(),
@@ -997,6 +1136,7 @@ mod tests {
         queue.spawn(worker);
 
         let shared_state = AppState {
+            metrics: test_metrics_handle(),
             producer,
             storage,
             shutdown: queue.cancel_token.clone(),
@@ -1036,4 +1176,264 @@ mod tests {
             .unwrap()
         );
     }
+
+    #[tokio::test]
+    async fn metrics_endpoint_is_available() {
+        // 1. Инициализируем окружение и состояние (по вашему шаблону)
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+
+        let shared_state = AppState {
+            metrics: test_metrics_handle(), // Убедитесь, что этот хэндлер регистрирует метрики
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+
+        // 4. Construct the HTTP request
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response1 = app_clone.oneshot(request).await.unwrap();
+
+        // 6. Assert the response status is 200 OK
+        assert_eq!(response1.status(), StatusCode::CREATED);
+
+        // 2. Формируем GET запрос к эндпоинту /metrics
+        let request = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        // 3. Отправляем запрос в приложение
+        let response = app.oneshot(request).await.unwrap();
+
+        // 4. Проверяем HTTP статус 200 OK
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // 5. Читаем тело ответа (байт-буфер ограничиваем разумным лимитом, например 2MB)
+        let body_bytes = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+        let body_string = String::from_utf8(body_bytes.to_vec()).unwrap();
+        println!("body_string {}", body_string);
+        // 6. Проверяем наличие ожидаемой метрики в тексте ответа
+        assert!(
+            body_string.contains("http_requests_total"),
+            "Тело ответа не содержит ожидаемых метрик. Получено:\n{}",
+            body_string
+        );
+    }
+
+    #[tokio::test]
+    async fn request_id_is_present() {
+        // 1. Инициализируем окружение и состояние (по вашему шаблону)
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+
+        let shared_state = AppState {
+            metrics: test_metrics_handle(), // Убедитесь, что этот хэндлер регистрирует метрики
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+        let app = build_router(shared_state);
+        let app_clone = app.clone();
+
+        // 4. Construct the HTTP request
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .unwrap();
+
+        // 5. Execute the request against the router
+        let response1 = app_clone.oneshot(request).await.unwrap();
+
+        // 6. Assert the response status is 200 OK
+        assert_eq!(response1.status(), StatusCode::CREATED);
+
+        let request_id_header = response1.headers().get("x-request-id");
+
+        assert!(
+            request_id_header.is_some(),
+            "Заголовок x-request-id не вернулся"
+        );
+    }
+
+    fn metric_value(body: &str, name: &str) -> f64 {
+        body.lines()
+            .find_map(|line| {
+                let mut parts = line.split_whitespace();
+
+                if parts.next()? == name {
+                    parts.next()?.parse().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(0.0)
+    }
+
+    async fn get_metrics(app: Router) -> String {
+        let request = Request::builder()
+            .method("GET")
+            .uri("/metrics")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = to_bytes(response.into_body(), 2 * 1024 * 1024)
+            .await
+            .unwrap();
+
+        String::from_utf8(body.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn successful_request_updates_metrics() {
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+
+        // BEFORE
+        let before = get_metrics(app.clone()).await;
+
+        let received_before = metric_value(&before, "events_received_total");
+
+        let persisted_before = metric_value(&before, "events_persisted_total");
+
+        // ACTION
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                "event_id":"successful-metrics-test",
+                "tenant_id":"2",
+                "event_type":"click",
+                "timestamp":1700000000,
+                "payload":"test"
+            }"#,
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // AFTER
+        let after = get_metrics(app.clone()).await;
+
+        let received_after = metric_value(&after, "events_received_total");
+
+        let persisted_after = metric_value(&after, "events_persisted_total");
+
+        assert!(
+            received_after >= received_before + 1.0,
+            "events_received_total did not increase"
+        );
+
+        assert!(
+            persisted_after >= persisted_before + 1.0,
+            "events_persisted_total did not increase"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_request_updates_error_metrics() {
+        let storage = FailingStorage::default();
+        let storage_clone = storage.clone();
+
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state);
+
+        // BEFORE
+        let before = get_metrics(app.clone()).await;
+
+        let received_before = metric_value(&before, "events_rejected_total");
+
+        let persisted_before = metric_value(&before, "db_errors_total");
+
+        // ACTION
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{
+                "event_id":"successful-metrics-test",
+                "tenant_id":"2",
+                "event_type":"click",
+                "timestamp":1700000000,
+                "payload":"test"
+            }"#,
+            ))
+            .unwrap();
+
+        let response = app.clone().oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+
+        // AFTER
+        let after = get_metrics(app.clone()).await;
+
+        let received_after = metric_value(&after, "events_rejected_total");
+
+        let persisted_after = metric_value(&after, "db_errors_total");
+
+        assert!(
+            received_after == received_before + 1.0,
+            "events_rejected_total did not increase"
+        );
+
+        assert!(
+            persisted_after == persisted_before + 1.0,
+            "db_errors_total did not increase"
+        );
+    }
+
+    #[tokio::test]
+    async fn queue_depth_metric_changes() {}
 }

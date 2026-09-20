@@ -11,18 +11,28 @@ use crate::{
 
 use sqlx::postgres::PgPoolOptions;
 use std::time::Duration;
+use tracing::info;
+
+use metrics_exporter_prometheus::PrometheusBuilder;
 
 const BUFFER_SIZE: usize = 100;
 const BATCH_SIZE: usize = 50;
 
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("rust_event_stream=info".parse().unwrap()),
+        )
+        .init();
+
     dotenvy::dotenv().expect("Не удалось загрузить .env файл");
 
     let database_url = std::env::var("DATABASE_URL").expect("DATABASE_URL must be set");
 
     let pool = PgPoolOptions::new()
-        .max_connections(5)
+        .max_connections(50)
         .acquire_timeout(Duration::from_secs(3))
         .connect(&database_url)
         .await?;
@@ -32,21 +42,21 @@ async fn main() -> Result<(), sqlx::Error> {
     let (producer, mut queue, worker) = BoundedQueue::new(BUFFER_SIZE, storage, BATCH_SIZE);
 
     let shutdown_token = queue.cancel_token.clone();
+    let metrics_handle = PrometheusBuilder::new().install_recorder().unwrap();
 
     let shared_state = AppState {
         producer,
         storage: worker_storage,
         shutdown: shutdown_token,
+        metrics: metrics_handle,
     };
 
     queue.spawn(worker);
 
     let app = build_router(shared_state);
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:3000")
-        .await
-        .unwrap();
-    println!("Сервер запущен на http://127.0.0.1:3000");
+    let server_addr = "127.0.0.1:3000";
+    let listener = tokio::net::TcpListener::bind(server_addr).await.unwrap();
+    info!(address = %server_addr, "server startup");
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

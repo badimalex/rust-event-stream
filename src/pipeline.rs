@@ -8,6 +8,10 @@ use tokio_util::sync::CancellationToken;
 
 use crate::domain::Event;
 use crate::storage::{EventOutcome, Storage, StorageError};
+use tracing::{error, info, warn};
+
+use metrics::{counter, gauge, histogram};
+use std::time::Instant;
 
 type ReplyTx = tokio::sync::oneshot::Sender<Result<EventOutcome, Arc<StorageError>>>;
 
@@ -34,10 +38,14 @@ impl EventProducer {
 
         let request = PersistRequest { event, reply_to };
 
-        self.tx
-            .send(request)
+        let permit = self
+            .tx
+            .reserve()
             .await
             .map_err(|_| EventSendError::QueueClosed)?;
+
+        gauge!("queue_depth").increment(1.0);
+        permit.send(request);
 
         match ack_rx.await {
             Ok(Ok(outcome)) => Ok(outcome),
@@ -98,12 +106,17 @@ impl BoundedQueue {
     }
 
     pub async fn shutdown(&mut self) -> Result<(), JoinError> {
+        warn!("shutdown start");
+
         if !self.cancel_token.is_cancelled() {
             self.cancel_token.cancel();
         }
 
-        if let Some(handle) = self.worker_handle.take() {
-            handle.await?;
+        if let Some(handle) = self.worker_handle.take()
+            && let Err(err) = handle.await
+        {
+            error!(target: "worker", error = ?err, "worker failed");
+            return Err(err);
         }
         Ok(())
     }
@@ -137,6 +150,8 @@ where
                 }
 
                 Some(request) = self.rx.recv() => {
+                    gauge!("queue_depth").decrement(1.0);
+
                     if self.buffer.is_empty() {
                         self.flush_deadline = Some(tokio::time::Instant::now() + self.flush_interval);
                     }
@@ -165,9 +180,12 @@ where
             }
         }
 
+        info!("worker termintion");
+
         self.rx.close();
 
         while let Some(request) = self.rx.recv().await {
+            gauge!("queue_depth").decrement(1.0);
             self.buffer.push(request);
 
             if self.buffer.len() >= self.batch_size {
@@ -184,11 +202,15 @@ where
         }
 
         let batch = std::mem::replace(&mut self.buffer, Vec::with_capacity(self.batch_size));
+        histogram!("batch_size").record(batch.len() as f64);
 
         let (events, reply_tos): (Vec<Event>, Vec<ReplyTx>) =
             batch.into_iter().map(|p| (p.event, p.reply_to)).unzip();
 
+        let started = Instant::now();
         let result = self.storage.persist(&events).await;
+        histogram!("db_write_duration_seconds").record(started.elapsed().as_secs_f64());
+
         match result {
             Ok(outcomes) => {
                 if outcomes.len() != reply_tos.len() {
@@ -197,7 +219,10 @@ where
                         reply_tos.len(),
                         outcomes.len()
                     )));
-
+                    error!(
+                        error = %error,
+                        "storage failed"
+                    );
                     for reply_to in reply_tos {
                         let _ = reply_to.send(Err(Arc::clone(&error)));
                     }
@@ -210,7 +235,12 @@ where
                 }
             }
             Err(error) => {
+                counter!("db_errors_total").increment(1);
                 let error = Arc::new(error);
+                error!(
+                    error = %error,
+                    "storage failed"
+                );
                 for reply_to in reply_tos {
                     let _ = reply_to.send(Err(Arc::clone(&error)));
                 }
