@@ -253,6 +253,8 @@ where
 mod tests {
     use std::time::Duration;
 
+    use serde_json::json;
+
     use crate::storage::{BlockingStorage, FailingStorage, PanicStorage, TestStorage};
 
     use super::*;
@@ -305,7 +307,9 @@ mod tests {
                     "1".to_string(),
                     "1".to_string(),
                     12345,
-                    "1".to_string(),
+                    json!({
+                        "1":"1"
+                    }),
                 )
                 .unwrap(),
             )
@@ -317,7 +321,9 @@ mod tests {
                     "1".to_string(),
                     "1".to_string(),
                     12345,
-                    "1".to_string(),
+                    json!({
+                        "1":"1"
+                    }),
                 )
                 .unwrap(),
             )
@@ -329,7 +335,9 @@ mod tests {
                     "1".to_string(),
                     "1".to_string(),
                     12345,
-                    "1".to_string(),
+                    json!({
+                        "1":"1"
+                    }),
                 )
                 .unwrap(),
             )
@@ -346,7 +354,9 @@ mod tests {
                 "1".to_string(),
                 "1".to_string(),
                 12345,
-                "1".to_string()
+                json!({
+                    "1":"1"
+                }),
             )
             .unwrap()
         );

@@ -320,6 +320,57 @@ mod tests {
     }
 
     #[sqlx::test]
+    async fn sql_like_payload_is_stored_as_data(pool: sqlx::PgPool) {
+        // 1. Создаем PostgresStorage и подготавливаем данные
+        let storage = PostgresStorage::new(pool);
+
+        // Формируем опасные SQL-строки для проверки экранирования
+        let dangerous_tenant = "tenant'; DROP TABLE events; --";
+        let dangerous_payload = serde_json::json!({
+            "command": "'; DROP TABLE events; --",
+            "query": "SELECT * FROM users WHERE admin = true"
+        });
+
+        // 2. Создаем Event с SQL-looking строками
+        let mut event = mock_event("evt_sql_injection_test");
+        event.tenant_id = dangerous_tenant.to_string();
+        event.payload = dangerous_payload; // Предполагается, что payload принимает serde_json::Value
+
+        // 4. Сохраняем событие в базу данных
+        let persist_result = storage.persist(&[event.clone()]).await;
+        assert!(
+            persist_result.is_ok(),
+            "Не удалось сохранить Event с SQL-like структурами"
+        );
+
+        // 5. Получаем событие обратно по ID
+        let loaded_event = storage
+            .get_by_id(&event.event_id)
+            .await
+            .expect("Ошибка при выполнении get_by_id")
+            .expect("Event не был найден в базе данных");
+
+        // 6. Проверяем, что загруженный Event идентичен исходному
+        assert_eq!(loaded_event.tenant_id, event.tenant_id);
+        assert_eq!(loaded_event.payload, event.payload);
+        assert_eq!(loaded_event, event);
+
+        // 7. Дополнительно убеждаемся, что таблица существует и запись на месте
+        let db_check = sqlx::query!(
+            "SELECT event_id FROM events WHERE tenant_id = $1",
+            dangerous_tenant
+        )
+        .fetch_one(&storage.pool)
+        .await;
+
+        assert!(
+            db_check.is_ok(),
+            "Похоже, таблица была повреждена или запись не найдена!"
+        );
+        assert_eq!(db_check.unwrap().event_id, "evt_sql_injection_test");
+    }
+
+    #[sqlx::test]
     async fn event_can_be_loaded_by_id(pool: sqlx::PgPool) {
         let storage = PostgresStorage::new(pool);
         let event = mock_event("evt_002");

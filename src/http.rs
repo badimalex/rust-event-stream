@@ -12,12 +12,6 @@ use axum::{
     routing::{get, post},
 };
 
-// use axum::{
-//     body::{to_bytes, Body},
-//     http::{Request, StatusCode},
-// };
-// use tower::ServiceExt;
-
 use metrics::{counter, histogram};
 use metrics_exporter_prometheus::PrometheusHandle;
 
@@ -53,13 +47,21 @@ where
     pub metrics: PrometheusHandle,
 }
 
-pub fn build_router<S>(state: AppState<S>) -> Router
+#[derive(Clone)]
+pub struct AuthConfig {
+    pub api_key: String,
+}
+
+pub fn build_router<S>(state: AppState<S>, auth_config: AuthConfig) -> Router
 where
     S: Storage + Clone + 'static,
 {
-    let api_router = Router::new()
+    let protected_router = Router::new()
         .route("/v1/events/{id}", get(get_event::<S>))
-        .route("/v1/events", post(create_event_handler))
+        .route("/v1/events", post(create_event_handler));
+
+    let api_router = Router::new()
+        .merge(protected_router)
         .layer(
             ServiceBuilder::new()
                 .layer(RequestBodyLimitLayer::new(1024 * 1024))
@@ -68,7 +70,8 @@ where
                 .concurrency_limit(100)
                 .timeout(Duration::from_secs(5)),
         )
-        .layer(middleware::from_fn(trace_request_middleware));
+        .layer(middleware::from_fn(trace_request_middleware))
+        .layer(middleware::from_fn_with_state(auth_config, require_api_key));
 
     Router::new()
         .route("/metrics", get(metrics))
@@ -76,6 +79,29 @@ where
         .route("/ready", get(ready::<S>))
         .merge(api_router)
         .with_state(state)
+}
+
+pub async fn require_api_key(
+    State(auth_config): State<AuthConfig>,
+    headers: axum::http::HeaderMap,
+    request: axum::extract::Request,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let provided_key = headers
+        .get("X-API-Key")
+        .and_then(|value| value.to_str().ok());
+
+    let key = match provided_key {
+        Some(k) => k,
+        None => return Err(StatusCode::UNAUTHORIZED),
+    };
+
+    if key != auth_config.api_key {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    let response = next.run(request).await;
+    Ok(response)
 }
 
 // 3. Кастомный Middleware, выполняющий контракт
@@ -152,9 +178,11 @@ async fn handle_middleware_errors(err: BoxError) -> (StatusCode, String) {
         );
     }
 
+    tracing::error!(error = %err, "unhandled middleware error");
+
     (
         StatusCode::INTERNAL_SERVER_ERROR,
-        format!("Unhandled middleware error: {}", err),
+        "Internal server error".to_string(),
     )
 }
 
@@ -164,7 +192,7 @@ pub struct CreateEventRequest {
     pub tenant_id: String,
     pub event_type: String,
     pub timestamp: u64,
-    pub payload: String,
+    pub payload: serde_json::Value,
 }
 
 // Ответ в случае ошибки валидации
@@ -173,7 +201,6 @@ pub struct ApiErrorResponse {
     pub error: String,
 }
 
-// Конвертация DTO -> Domain с валидацией
 impl TryFrom<CreateEventRequest> for Event {
     type Error = DomainError;
 
@@ -201,6 +228,10 @@ impl IntoResponse for ApiError {
                     DomainError::InvalidTimestamp => (
                         StatusCode::BAD_REQUEST,
                         "Временная метка (timestamp) должна быть больше 0".to_string(),
+                    ),
+                    DomainError::TooLongField { name, max_len } => (
+                        StatusCode::BAD_REQUEST,
+                        format!("Поле '{}' '{}' не должно быть пустым", name, max_len),
                     ),
                 };
                 (status, Json(ApiErrorResponse { error: message })).into_response()
@@ -331,6 +362,7 @@ mod tests {
         http::{Request, StatusCode},
     };
     use metrics_exporter_prometheus::PrometheusBuilder;
+    use serde_json::json;
     use tokio::task::JoinSet;
     use tower::util::ServiceExt;
 
@@ -342,6 +374,12 @@ mod tests {
                     .expect("failed to install test metrics recorder")
             })
             .clone()
+    }
+
+    fn test_auth_config() -> AuthConfig {
+        AuthConfig {
+            api_key: "test-api-key".to_string(),
+        }
     }
 
     #[tokio::test]
@@ -357,7 +395,7 @@ mod tests {
             shutdown: queue.cancel_token.clone(),
         };
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let oversized_bytes = vec![0u8; 1_048_576 + 1];
 
@@ -365,6 +403,7 @@ mod tests {
             .method(axum::http::Method::POST)
             .uri("/v1/events")
             .header(axum::http::header::CONTENT_TYPE, "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(axum::body::Body::from(oversized_bytes))
             .unwrap();
 
@@ -389,12 +428,13 @@ mod tests {
             shutdown: queue.cancel_token.clone(),
         };
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -422,13 +462,14 @@ mod tests {
             shutdown: queue.cancel_token.clone(),
         };
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
 
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -445,6 +486,7 @@ mod tests {
                     .method("POST")
                     .uri("/v1/events")
                     .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
                     .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
                     .unwrap();
 
@@ -494,7 +536,7 @@ mod tests {
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
         };
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = Request::builder()
             .method("GET")
@@ -521,7 +563,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = Request::builder()
             .method("GET")
@@ -550,7 +592,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
 
         let request = Request::builder()
@@ -594,7 +636,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
         let app_clone2 = app.clone();
 
@@ -603,6 +645,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -654,7 +697,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
         let app_clone2 = app.clone();
 
@@ -708,12 +751,13 @@ mod tests {
             storage: storage_clone,
             shutdown: queue.cancel_token.clone(),
         };
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"#))
             .unwrap();
 
@@ -737,14 +781,15 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // 4. Construct the HTTP request
         let request = Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
             .unwrap();
 
         // 5. Execute the request against the router
@@ -762,7 +807,9 @@ mod tests {
                 "2".to_string(),
                 "click".to_string(),
                 1700000000,
-                "test".to_string()
+                json!({
+                    "1":"1"
+                }),
             )
             .unwrap()
         );
@@ -782,13 +829,14 @@ mod tests {
 
         drop(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // 4. Construct the HTTP request
         let request = Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -814,12 +862,13 @@ mod tests {
         };
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -840,7 +889,9 @@ mod tests {
                 "1".to_string(),
                 "1".to_string(),
                 12345,
-                "1".to_string(),
+                json!({
+                    "1":"1"
+                }),
             )
             .unwrap()])
             .await;
@@ -857,12 +908,13 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // 3. Construct the GET request
         let request = Request::builder()
             .uri("/v1/events/evt-123")
             .method("GET")
+            .header("X-API-Key", "test-api-key")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -884,7 +936,9 @@ mod tests {
                 "1".to_string(),
                 "1".to_string(),
                 12345,
-                "1".to_string(),
+                json!({
+                    "1":"1"
+                }),
             )
             .unwrap()])
             .await;
@@ -901,12 +955,13 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // 3. Construct the GET request
         let request = Request::builder()
             .uri("/v1/events/evt-345")
             .method("GET")
+            .header("X-API-Key", "test-api-key")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -935,12 +990,13 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // 3. Construct the GET request
         let request = Request::builder()
             .uri("/v1/events/evt-failed")
             .method("GET")
+            .header("X-API-Key", "test-api-key")
             .body(axum::body::Body::empty())
             .unwrap();
 
@@ -968,7 +1024,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let clone_app = app.clone();
 
         // 4. Construct the HTTP request
@@ -976,7 +1032,8 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
             .unwrap();
 
         // 5. Execute the request against the router
@@ -990,7 +1047,8 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
             .unwrap();
 
         // 5. Execute the request against the router
@@ -1009,7 +1067,9 @@ mod tests {
                 "2".to_string(),
                 "click".to_string(),
                 1700000000,
-                "test".to_string()
+                json!({
+                    "1":"1"
+                }),
             )
             .unwrap()
         );
@@ -1030,7 +1090,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let clone_app = app.clone();
 
         // 4. Construct the HTTP request
@@ -1038,7 +1098,8 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"user-a"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"user-a"}}"#))
             .unwrap();
 
         // 5. Execute the request against the router
@@ -1052,6 +1113,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"evt-123","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"user-2"}"#))
             .unwrap();
 
@@ -1071,7 +1133,9 @@ mod tests {
                 "2".to_string(),
                 "click".to_string(),
                 1700000000,
-                "user-a".to_string()
+                json!({
+                    "1":"user-a"
+                }),
             )
             .unwrap()
         );
@@ -1093,13 +1157,14 @@ mod tests {
             shutdown: queue.cancel_token.clone(),
         };
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"test"}}"#))
             .unwrap();
 
         let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
@@ -1120,7 +1185,9 @@ mod tests {
                 "2".to_string(),
                 "click".to_string(),
                 1700000000,
-                "test".to_string()
+                json!({
+                    "1":"test"
+                }),
             )
             .unwrap()
         );
@@ -1142,13 +1209,14 @@ mod tests {
             shutdown: queue.cancel_token.clone(),
         };
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         let request = axum::http::Request::builder()
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
-            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(r#"{"event_id":"evt-12341","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"test"}}"#))
             .unwrap();
 
         let response_task = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
@@ -1171,7 +1239,9 @@ mod tests {
                 "2".to_string(),
                 "click".to_string(),
                 1700000000,
-                "test".to_string()
+                json!({
+                    "1":"test"
+                }),
             )
             .unwrap()
         );
@@ -1192,7 +1262,7 @@ mod tests {
         };
 
         queue.spawn(worker);
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
 
         // 4. Construct the HTTP request
@@ -1200,6 +1270,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -1251,7 +1322,7 @@ mod tests {
         };
 
         queue.spawn(worker);
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
         let app_clone = app.clone();
 
         // 4. Construct the HTTP request
@@ -1259,6 +1330,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":"test"}"#))
             .unwrap();
 
@@ -1324,7 +1396,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // BEFORE
         let before = get_metrics(app.clone()).await;
@@ -1338,6 +1410,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(
                 r#"{
                 "event_id":"successful-metrics-test",
@@ -1387,7 +1460,7 @@ mod tests {
 
         queue.spawn(worker);
 
-        let app = build_router(shared_state);
+        let app = build_router(shared_state, test_auth_config());
 
         // BEFORE
         let before = get_metrics(app.clone()).await;
@@ -1401,6 +1474,7 @@ mod tests {
             .method("POST")
             .uri("/v1/events")
             .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
             .body(Body::from(
                 r#"{
                 "event_id":"successful-metrics-test",
@@ -1434,6 +1508,103 @@ mod tests {
         );
     }
 
+    // [todo]
     #[tokio::test]
     async fn queue_depth_metric_changes() {}
+
+    #[tokio::test]
+    async fn missing_auth_is_rejected() {
+        let storage = TestStorage::default();
+        let (producer, queue, _) = BoundedQueue::new(100, storage.clone(), 3);
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        let app = build_router(shared_state, test_auth_config());
+
+        let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events")
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
+        .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn invalid_auth_is_rejected() {
+        let storage = TestStorage::default();
+        let (producer, queue, _) = BoundedQueue::new(100, storage.clone(), 3);
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        let app = build_router(shared_state, test_auth_config());
+
+        let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events")
+        .header("content-type", "application/json")
+        .header("X-API-Key", "wrong-key")  
+        .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
+        .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn valid_auth_reaches_handler() {
+        let storage = TestStorage::default();
+        let storage_clone = storage.clone();
+        let sink = storage.clone();
+        let (producer, mut queue, worker) = BoundedQueue::new(100, storage, 3);
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage: storage_clone,
+            shutdown: queue.cancel_token.clone(),
+        };
+
+        queue.spawn(worker);
+
+        let app = build_router(shared_state, test_auth_config());
+
+        let request = Request::builder()
+        .method("POST")
+        .uri("/v1/events")
+        .header("content-type", "application/json")
+        .header("X-API-Key", "test-api-key") // Валидный ключ
+        .body(Body::from(r#"{"event_id":"1","tenant_id":"2","event_type":"click","timestamp":1700000000,"payload":{"1":"1"}}"#))
+        .unwrap();
+
+        let response = app.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        queue.shutdown().await.unwrap();
+
+        assert_eq!(sink.events.lock().await.len(), 1);
+        assert_eq!(
+            sink.events.lock().await[0],
+            Event::new(
+                "1".to_string(),
+                "2".to_string(),
+                "click".to_string(),
+                1700000000,
+                json!({"1":"1"}),
+            )
+            .unwrap()
+        );
+    }
 }
