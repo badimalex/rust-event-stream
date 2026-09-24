@@ -16,7 +16,7 @@ use tracing::info;
 use metrics_exporter_prometheus::PrometheusBuilder;
 
 const BUFFER_SIZE: usize = 100;
-const BATCH_SIZE: usize = 50;
+const BATCH_SIZE: usize = 100;
 
 #[tokio::main]
 async fn main() -> Result<(), sqlx::Error> {

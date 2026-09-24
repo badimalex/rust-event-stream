@@ -22,14 +22,18 @@ Accepted events are persisted to PostgreSQL using batched writes.
 
 ## Performance
 
-Benchmark: 100 concurrent clients, 30 seconds, 0% errors.
+D12 benchmark: authenticated `POST /v1/events`, local PostgreSQL, release build, unique event IDs.
 
-| Persistence strategy                                                                                         | Successful events |      Throughput |
-| ------------------------------------------------------------------------------------------------------------ | ----------------: | --------------: |
-| [Single-row writes baseline](https://github.com/badimalex/rust-event-stream/tree/perf-baseline-pre-batching) | 60,095 | 2,000 events/s |
-| [Batched PostgreSQL writes](https://github.com/badimalex/rust-event-stream/commit/52dd1b90686ee768b58961afaf06244a0cff55f1) | 307,022 | 10,217 events/s |
-**Result: ~5.1× higher error-free event persistence throughput.**
+| Configuration | Concurrency | Successful events/s | p95 | Errors |
+| --- | ---: | ---: | ---: | ---: |
+| `batch_size=50` | 100 | 374 | 750 ms | 0% |
+| `batch_size=100` | 100 | 1,033 | 261 ms | 0% |
 
+Increasing only `batch_size` from 50 to 100 improved throughput by ~2.76×.
+
+At 200 concurrent clients the bounded queue reached its capacity and overload protection rejected excess traffic, mostly with `503 Service Unavailable`.
+
+During a PostgreSQL outage `/ready` returned `503`; after PostgreSQL recovered, `/ready` returned `200` without restarting the application.
 
 ## Architecture
 
