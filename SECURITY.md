@@ -3,6 +3,8 @@
 ## Authentication
 `/v1/events` and `/v1/events/{id}` require `X-API-Key`.
 
+The API key is loaded from the `API_KEY` environment variable.
+
 ## Authorization
 Per-tenant authorization is not implemented.
 

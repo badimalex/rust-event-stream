@@ -413,7 +413,7 @@ mod tests {
         assert_eq!(response.status(), axum::http::StatusCode::PAYLOAD_TOO_LARGE);
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn slow_request_times_out() {
         let storage = BlockingStorage::default();
         let storage_check = storage.clone();
@@ -447,7 +447,7 @@ mod tests {
         queue.shutdown().await.unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn concurrency_limit_is_enforced() {
         let storage = BlockingStorage::default();
         let storage_check = storage.clone();
@@ -1508,9 +1508,71 @@ mod tests {
         );
     }
 
-    // [todo]
     #[tokio::test]
-    async fn queue_depth_metric_changes() {}
+    async fn queue_depth_metric_changes() {
+        let storage = TestStorage::default();
+        let (producer, mut queue, worker) = BoundedQueue::new(1, storage.clone(), 1);
+        let shared_state = AppState {
+            metrics: test_metrics_handle(),
+            producer,
+            storage,
+            shutdown: queue.cancel_token.clone(),
+        };
+        let app = build_router(shared_state, test_auth_config());
+        let app_clone = app.clone();
+
+        let before = get_metrics(app.clone()).await;
+
+        let received_before = metric_value(&before, "queue_depth");
+
+        // ACTION
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/events")
+            .header("content-type", "application/json")
+            .header("X-API-Key", "test-api-key")
+            .body(Body::from(
+                r#"{
+                "event_id":"successful-metrics-test",
+                "tenant_id":"2",
+                "event_type":"click",
+                "timestamp":1700000000,
+                "payload":"test"
+            }"#,
+            ))
+            .unwrap();
+
+        let response_task = tokio::spawn(async move { app_clone.oneshot(request).await.unwrap() });
+        tokio::task::yield_now().await;
+
+        // AFTER
+        let after = get_metrics(app.clone()).await;
+
+        let received_after = metric_value(&after, "queue_depth");
+
+        assert!(
+            received_after >= received_before + 1.0,
+            "events_received_total did not increase"
+        );
+
+        queue.spawn(worker);
+
+        let response = response_task.await.unwrap();
+
+        assert_eq!(response.status(), StatusCode::CREATED);
+
+        // FINAL
+        let final_metrics = get_metrics(app.clone()).await;
+
+        let received_final = metric_value(&final_metrics, "queue_depth");
+
+        assert!(
+            received_final == received_before,
+            "events_received_total did not increase"
+        );
+
+        queue.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn missing_auth_is_rejected() {

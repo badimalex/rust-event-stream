@@ -362,7 +362,7 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn batch_flushes_when_interval_expires() {
         let storage = BlockingStorage::default();
         let storage_check = storage.clone();

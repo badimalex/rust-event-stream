@@ -98,9 +98,9 @@ Successful requests return:
 
 ### `GET /ready`
 
-Basic readiness endpoint.
+Readiness endpoint.
 
-At the current stage it returns `200 OK`. More complete readiness checks for the pipeline and external dependencies will be added as the project evolves.
+Returns `200 OK` when the event pipeline is available and PostgreSQL is reachable. Returns `503 Service Unavailable` when the pipeline is closed or the storage health check fails.
 
 ## Overload Protection
 
@@ -171,3 +171,9 @@ cargo test
 cargo fmt --check
 cargo clippy -- -D warnings
 ```
+
+## Observability
+
+The service uses structured `tracing` with a per-request `request_id`.
+
+Prometheus metrics are exposed through `/metrics`, including HTTP request metrics, `queue_depth`, database write duration, and database error counters.
