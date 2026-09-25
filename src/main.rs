@@ -67,7 +67,7 @@ async fn main() -> Result<(), sqlx::Error> {
 
     queue.shutdown().await.unwrap();
 
-    Ok(()) // [todo] незнаю насколько оправдано ведь выше shutdown awa,t server awit и тд ошибки не обрабатываются
+    Ok(())
 }
 
 async fn shutdown_signal() {

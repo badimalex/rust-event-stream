@@ -131,6 +131,14 @@ The application completes shutdown after the worker has finished processing the 
 - PostgreSQL
 - `sqlx-cli`
 
+### Configuration
+
+Set:
+
+```bash
+export DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres
+export API_KEY=dev-secret
+
 ### Run
 
 ```bash
@@ -181,3 +189,13 @@ cargo clippy -- -D warnings
 The service uses structured `tracing` with a per-request `request_id`.
 
 Prometheus metrics are exposed through `/metrics`, including HTTP request metrics, `queue_depth`, database write duration, and database error counters.
+
+## Documentation
+
+- [Benchmark](BENCHMARK.md)
+- [Security](SECURITY.md)
+- [Failure modes](FAILURE_MODES.md)
+
+## Known Limitation
+
+Per-tenant authorization is not implemented.

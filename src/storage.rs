@@ -185,23 +185,6 @@ impl Storage for PostgresStorage {
 
         Ok(())
     }
-    /*async fn persist(&self, event: &Event) -> Result<(), StorageError> {
-        sqlx::query(
-            r#"
-            INSERT INTO events (event_id, tenant_id, event_type, event_timestamp, payload)
-            VALUES ($1, $2, $3, $4, $5::jsonb)
-            "#,
-        )
-        .bind(&event.event_id)
-        .bind(&event.tenant_id)
-        .bind(&event.event_type)
-        .bind(event.event_timestamp as i64)
-        .bind(&event.payload)
-        .execute(&self.pool)
-        .await?;
-
-        Ok(())
-    }*/
 
     async fn get_by_id(&self, event_id: &str) -> Result<Option<Event>, StorageError> {
         let row = sqlx::query(
